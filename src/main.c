@@ -53,25 +53,10 @@ void quick_save(scene_specification_t* scene) {
 		return;
 	}
 	fwrite(&scene->camera, sizeof(scene->camera), 1, file);
+	fwrite(&scene->linear_light_count, sizeof(uint32_t), 1, file);
+	fwrite(scene->linear_lights, sizeof(linear_light_t), scene->linear_light_count, file);
 	uint32_t legacy_count = 0;
 	fwrite(&legacy_count, sizeof(uint32_t), 1, file);
-	fwrite(&scene->polygonal_light_count, sizeof(uint32_t), 1, file);
-	for (uint32_t i = 0; i != scene->polygonal_light_count; ++i) {
-		polygonal_light_t* light = &scene->polygonal_lights[i];
-		fwrite(light, POLYGONAL_LIGHT_QUICKSAVE_SIZE, 1, file);
-		size_t path_size = 0;
-		if (light->texture_file_path) {
-			path_size = strlen(light->texture_file_path) + 1;
-			fwrite(&path_size, sizeof(path_size), 1, file);
-			fwrite(light->texture_file_path, sizeof(char), path_size, file);
-		}
-		else
-			fwrite(&path_size, sizeof(path_size), 1, file);
-		// Write NULL pointers for backward compatibility
-		float* null_pointers[2] = {NULL, NULL};
-		fwrite(null_pointers, sizeof(float*), 2, file);
-		fwrite(light->vertices_plane_space, sizeof(float), 4 * light->vertex_count, file);
-	}
 	fclose(file);
 }
 
@@ -87,46 +72,18 @@ void quick_load(scene_specification_t* scene, application_updates_t* updates) {
 	}
 	// Load the camera
 	fread(&scene->camera, sizeof(scene->camera), 1, file);
+	// Load linear lights
+	uint32_t old_linear_light_count = scene->linear_light_count;
+	free(scene->linear_lights);
+	fread(&scene->linear_light_count, sizeof(uint32_t), 1, file);
+	scene->linear_lights = malloc(sizeof(linear_light_t) * scene->linear_light_count);
+	fread(scene->linear_lights, sizeof(linear_light_t), scene->linear_light_count, file);
 	// Legacy
 	uint32_t legacy_count;
 	fread(&legacy_count, sizeof(uint32_t), 1, file);
-	// Load polygonal lights
-	uint32_t old_polygonal_light_count = scene->polygonal_light_count;
-	polygonal_light_t* old_polygonal_lights = scene->polygonal_lights;
-	scene->polygonal_light_count = 0;
-	fread(&scene->polygonal_light_count, sizeof(uint32_t), 1, file);
-	VkBool32 vertex_count_changed = VK_FALSE;
-	scene->polygonal_lights = malloc(sizeof(polygonal_light_t) * scene->polygonal_light_count);
-	for (uint32_t i = 0; i != scene->polygonal_light_count; ++i) {
-		polygonal_light_t* light = &scene->polygonal_lights[i];
-		fread(light, POLYGONAL_LIGHT_QUICKSAVE_SIZE, 1, file);
-		if (i < old_polygonal_light_count && light->vertex_count != old_polygonal_lights[i].vertex_count)
-			vertex_count_changed = VK_TRUE;
-		// Quick fix for legacy files
-		if (light->scaling_y <= 0.0f) light->scaling_y = light->scaling_x;
-		// Read the texture file path (if any)
-		size_t path_size = 0;
-		fread(&path_size, sizeof(path_size), 1, file);
-		light->texture_file_path = NULL;
-		if (path_size) {
-			light->texture_file_path = malloc(sizeof(char) * path_size);
-			fread(light->texture_file_path, sizeof(char), path_size, file);
-			if (i < old_polygonal_light_count && old_polygonal_lights[i].texture_file_path != NULL && strcmp(light->texture_file_path, old_polygonal_lights[i].texture_file_path) != 0)
-				updates->update_light_textures = VK_TRUE;
-		}
-		// Read NULL pointers for backward compatibility
-		fread(&light->vertices_plane_space, sizeof(float*), 2, file);
-		light->fan_areas = NULL;
-		// Allocate and read vertex locations
-		set_polygonal_light_vertex_count(light, light->vertex_count);
-		fread(light->vertices_plane_space, sizeof(float), 4 * light->vertex_count, file);
-	}
-	for (uint32_t i = 0; i != old_polygonal_light_count; ++i)
-		destroy_polygonal_light(&old_polygonal_lights[i]);
-	free(old_polygonal_lights);
 	fclose(file);
 	if (updates)
-		updates->update_light_count |= old_polygonal_light_count != scene->polygonal_light_count || vertex_count_changed;
+		updates->update_light_count |= old_linear_light_count != scene->linear_light_count;
 }
 
 
@@ -145,74 +102,17 @@ void specify_default_scene(scene_specification_t* scene) {
 		.speed = 2.0f
 	};
 	scene->camera = camera;
-	// Create a polygonal light
-	scene->polygonal_light_count = 1;
-	polygonal_light_t default_light;
-	memset(&default_light, 0, sizeof(default_light));
-	default_light.rotation_angles[0] = 0.5f * M_PI_F;
-	default_light.scaling_x = default_light.scaling_y = 1.0f;
-	default_light.radiant_flux[0] = default_light.radiant_flux[1] = default_light.radiant_flux[2] = 1.0f;
-	set_polygonal_light_vertex_count(&default_light, 4);
-	default_light.vertices_plane_space[0 * 4 + 0] = 0.0f;
-	default_light.vertices_plane_space[0 * 4 + 1] = 0.0f;
-	default_light.vertices_plane_space[1 * 4 + 0] = 1.0f;
-	default_light.vertices_plane_space[1 * 4 + 1] = 0.0f;
-	default_light.vertices_plane_space[2 * 4 + 0] = 1.0f;
-	default_light.vertices_plane_space[2 * 4 + 1] = 1.0f;
-	default_light.vertices_plane_space[3 * 4 + 0] = 0.0f;
-	default_light.vertices_plane_space[3 * 4 + 1] = 1.0f;
-	scene->polygonal_lights = malloc(sizeof(default_light));
-	scene->polygonal_lights[0] = default_light;
+	// Create a linear light
+	linear_light_t linear_light = {
+		.begin = { -2.0f, -1.0f, 2.4f },
+		.end = { 0.9f, -1.0f, 2.4f },
+		.radiance_times_radius = { 1.3f, 1.6f, 1.0f },
+	};
+	scene->linear_light_count = 1;
+	scene->linear_lights = malloc(sizeof(linear_light_t) * scene->linear_light_count);
+	scene->linear_lights[0] = linear_light;
 	// Try to quick load. Upon success, it will override the defaults above.
 	quick_load(scene, NULL);
-}
-
-
-//! \return The minimal number of vertices in a single polygonal light (3 if
-//!		there are no polygonal lights)
-uint32_t get_min_polygonal_light_vertex_count(const scene_specification_t* scene_specification) {
-	if (!scene_specification->polygonal_light_count) return 3;
-	uint32_t minimum = 0x7FFFFFFF;
-	for (uint32_t i = 0; i != scene_specification->polygonal_light_count; ++i)
-		if (minimum > scene_specification->polygonal_lights[i].vertex_count)
-			minimum = scene_specification->polygonal_lights[i].vertex_count;
-	return minimum;
-}
-
-//! \return The maximal number of vertices in a single polygonal light (3 if
-//!		there are no polygonal lights)
-uint32_t get_max_polygonal_light_vertex_count(const scene_specification_t* scene_specification) {
-	uint32_t maximum = 3;
-	for (uint32_t i = 0; i != scene_specification->polygonal_light_count; ++i)
-		if (maximum < scene_specification->polygonal_lights[i].vertex_count)
-			maximum = scene_specification->polygonal_lights[i].vertex_count;
-	return maximum;
-}
-
-//! \return The maximal number of vertices in a polygon for a polygonal light
-//!		that may occur after clipping
-uint32_t get_max_polygon_vertex_count(const scene_specification_t* scene_specification, const render_settings_t* render_settings) {
-	uint32_t max_polygonal_light_vertex_count = get_max_polygonal_light_vertex_count(scene_specification);
-	sampling_strategies_t sampling_strategies = render_settings->sampling_strategies;
-	switch (render_settings->polygon_sampling_technique) {
-	case sample_polygon_clipped_solid_angle:
-	case sample_polygon_bilinear_cosine_warp_clipping_hart:
-	case sample_polygon_biquadratic_cosine_warp_clipping_hart:
-	case sample_polygon_projected_solid_angle_arvo:
-	case sample_polygon_projected_solid_angle:
-	case sample_polygon_projected_solid_angle_biased:
-		// Each time the polygon is clipped, that may create another vertex
-		return max_polygonal_light_vertex_count + 1;
-	case sample_polygon_baseline:
-	case sample_polygon_area_turk:
-	case sample_polygon_rectangle_solid_angle_urena:
-	case sample_polygon_solid_angle_arvo:
-	case sample_polygon_solid_angle:
-	case sample_polygon_bilinear_cosine_warp_hart:
-	case sample_polygon_biquadratic_cosine_warp_hart:
-	default:
-		return max_polygonal_light_vertex_count;
-	}
 }
 
 
@@ -221,28 +121,28 @@ void destroy_scene_specification(scene_specification_t* scene) {
 	free(scene->file_path);
 	free(scene->texture_path);
 	free(scene->quick_save_path);
-	for (uint32_t i = 0; i != scene->polygonal_light_count; ++i)
-		destroy_polygonal_light(&scene->polygonal_lights[i]);
-	free(scene->polygonal_lights);
+	free(scene->linear_lights);
 	memset(scene, 0, sizeof(*scene));
 }
 
 
 //! Sets render settings to default values
 void specify_default_render_settings(render_settings_t* settings) {
+	settings->brdf_model = brdf_frostbite_diffuse_specular;
 	settings->exposure_factor = 8.0f;
 	settings->roughness_factor = 1.0f;
 	settings->sample_count = 1;
 	settings->sampling_strategies = sampling_strategies_diffuse_specular_mis;
 	settings->mis_heuristic = mis_heuristic_optimal_clamped;
 	settings->mis_visibility_estimate = 0.5f;
-	settings->polygon_sampling_technique = sample_polygon_projected_solid_angle;
+	settings->line_sampling_technique = sample_line_projected_solid_angle;
 	settings->error_display = error_display_none;
 	settings->error_min_exponent = -7.0f;
 	// This setting will be disabled if the device is unable to trace rays
 	settings->trace_shadow_rays = VK_TRUE;
-	settings->show_polygonal_lights = VK_TRUE;
-	settings->noise_type = noise_type_ahmed;
+	settings->show_linear_lights = VK_TRUE;
+	settings->noise_type = noise_type_blue;
+	settings->use_jittered_uniform = VK_TRUE;
 	settings->animate_noise = VK_TRUE;
 	settings->v_sync = VK_TRUE;
 	settings->show_gui = VK_TRUE;
@@ -330,10 +230,8 @@ void destroy_constant_buffers(constant_buffers_t* constant_buffers, const device
 int create_constant_buffers(constant_buffers_t* constant_buffers, const device_t* device, const swapchain_t* swapchain, const scene_specification_t* scene_specification, const render_settings_t* render_settings) {
 	memset(constant_buffers, 0, sizeof(*constant_buffers));
 	// Compute the total size for the constant buffer
-	size_t size = sizeof(per_frame_constants_t);
-	size_t polygonal_light_size = POLYGONAL_LIGHT_FIXED_CONSTANT_BUFFER_SIZE + sizeof(float) * (12 * get_max_polygonal_light_vertex_count(scene_specification) - 8);
-	size += scene_specification->polygonal_light_count * polygonal_light_size;
-	if (scene_specification->polygonal_light_count == 0) size += polygonal_light_size;
+	size_t size = sizeof(per_frame_constants_t) + scene_specification->linear_light_count * sizeof(linear_light_t);
+	if (scene_specification->linear_light_count == 0) size += sizeof(linear_light_t);
 	// Create one constant buffer per swapchain image
 	VkBufferCreateInfo constant_buffer_info = {
 		.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -357,63 +255,6 @@ int create_constant_buffers(constant_buffers_t* constant_buffers, const device_t
 		return 1;
 	}
 	return 0;
-}
-
-
-//! Frees objects and zeros
-void destroy_light_textures(images_t* light_textures, const device_t* device) {
-	destroy_images(light_textures, device);
-}
-
-//! Loads the textures for all polygonal light sources (avoiding duplication)
-//! and sets texture indices in the polygonal lights accordingly. Pass NULL for
-//! light_textures, if you only want to update indices.
-int create_and_assign_light_textures(images_t* light_textures, const device_t* device, scene_specification_t* scene_specification) {
-	// Create a list of all file paths, using a default for empty or invalid
-	// entries and removing duplicates
-	char default_path[] = "data/white.vkt";
-	const char** unique_paths = malloc(sizeof(char*) * (scene_specification->polygonal_light_count + 1));
-	uint32_t unique_count = 0;
-	for (uint32_t i = 0; i != scene_specification->polygonal_light_count; ++i) {
-		const char* new_path = scene_specification->polygonal_lights[i].texture_file_path;
-		if (!new_path || strlen(new_path) == 0)
-			new_path = default_path;
-		else {
-			// Check if the file exists and resort to the default if it does
-			// not
-			FILE* file = fopen(new_path, "rb");
-			if (file)
-				fclose(file);
-			else {
-				printf("The light texture at path %s does not exist. Using a white texture instead.\n", new_path);
-				new_path = default_path;
-			}
-		}
-		// Check if the new path is identical to an existing one
-		scene_specification->polygonal_lights[i].texture_index = unique_count;
-		for (uint32_t j = 0; j != unique_count; ++j)
-			if (strcmp(new_path, unique_paths[j]) == 0)
-				// Reuse the existing one
-				scene_specification->polygonal_lights[i].texture_index = j;
-		// Otherwise allocate a new one
-		if (scene_specification->polygonal_lights[i].texture_index == unique_count) {
-			unique_paths[unique_count] = new_path;
-			++unique_count;
-		}
-	}
-	if (!light_textures) {
-		free(unique_paths);
-		return 0;
-	}
-	// Empty descriptor arrays cause some trouble
-	if (unique_count == 0) {
-		unique_count = 1;
-		unique_paths[0] = default_path;
-	}
-	// Try to load the textures
-	int result = load_2d_textures(light_textures, device, unique_count, unique_paths, VK_IMAGE_USAGE_SAMPLED_BIT);
-	free(unique_paths);
-	return result;
 }
 
 
@@ -589,8 +430,6 @@ void destroy_shading_pass(shading_pass_t* pass, const device_t* device) {
 	destroy_pipeline_with_bindings(&pass->pipeline, device);
 	destroy_shader(&pass->vertex_shader, device);
 	destroy_shader(&pass->fragment_shader, device);
-	if (pass->light_texture_sampler)
-		vkDestroySampler(device->device, pass->light_texture_sampler, NULL);
 	memset(pass, 0, sizeof(*pass));
 }
 
@@ -609,25 +448,7 @@ int create_shading_pass(shading_pass_t* pass, application_t* app)
 	pipeline_with_bindings_t* pipeline = &pass->pipeline;
 	// Are we tracing rays?
 	pass->use_ray_tracing = app->render_settings.trace_shadow_rays && app->device.ray_tracing_supported;
-	// Create a sampler for light textures
-	VkSamplerCreateInfo sampler_info = {
-		.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
-		.magFilter = VK_FILTER_LINEAR, .minFilter = VK_FILTER_LINEAR,
-		.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR,
-		.anisotropyEnable = VK_FALSE, .maxAnisotropy = 1,
-		.minLod = 0.0f, .maxLod = 3.4e38f,
-		// This is the way to go for theta-phi parametrizations
-		.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT,
-		.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-		.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-	};
-	if (vkCreateSampler(device->device, &sampler_info, NULL, &pass->light_texture_sampler)) {
-		printf("Failed to create a sampler for light textures in the shading pass.\n");
-		destroy_shading_pass(pass, device);
-		return 1;
-	}
 	// Create descriptor sets for the shading pass
-	uint32_t light_texture_count = app->light_textures.image_count;
 	VkDescriptorSetLayoutBinding layout_bindings[] = {
 		{ .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER },
 		{ .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER },
@@ -637,7 +458,6 @@ int create_shading_pass(shading_pass_t* pass, application_t* app)
 		{ .binding = 5},
 		{ .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE },
 		{ .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 2 },
-		{ .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = light_texture_count },
 		{ .descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR },
 	};
 	get_materials_descriptor_layout(&layout_bindings[5], 5, &scene->materials);
@@ -682,17 +502,9 @@ int create_shading_pass(shading_pass_t* pass, application_t* app)
 		{ .dstBinding = 4, .pImageInfo = &visibility_buffer_info },
 		{ .dstBinding = 6, .pImageInfo = &noise_info },
 		{ .dstBinding = 7, .pImageInfo = ltc_table_infos },
-		{ .dstBinding = 8 },
 		{ .dstBinding = 5 },
 	};
-	VkDescriptorImageInfo* light_texture_writes = malloc(sizeof(VkDescriptorImageInfo) * light_texture_count);
-	for (uint32_t i = 0; i != light_texture_count; ++i) {
-		light_texture_writes[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-		light_texture_writes[i].imageView = app->light_textures.images[i].view;
-		light_texture_writes[i].sampler = pass->light_texture_sampler;
-	}
-	descriptor_set_writes[4].pImageInfo = light_texture_writes;
-	uint32_t material_write_index = 5;
+	uint32_t material_write_index = 4;
 	descriptor_set_writes[material_write_index].pImageInfo = get_materials_descriptor_infos(&descriptor_set_writes[material_write_index].descriptorCount, &scene->materials);
 	for (uint32_t i = 0; i != mesh_buffer_count; ++i) {
 		VkWriteDescriptorSet write = {
@@ -706,7 +518,7 @@ int create_shading_pass(shading_pass_t* pass, application_t* app)
 		.pAccelerationStructures = &app->scene.acceleration_structure.top_level
 	};
 	VkWriteDescriptorSet acceleration_structure_write = {
-		.dstBinding = 9, .pNext = &acceleration_structure_info
+		.dstBinding = 8, .pNext = &acceleration_structure_info
 	};
 	descriptor_set_writes[material_write_index + 1 + mesh_buffer_count] = acceleration_structure_write;
 	complete_descriptor_set_write(binding_count, descriptor_set_writes, &set_request);
@@ -718,18 +530,15 @@ int create_shading_pass(shading_pass_t* pass, application_t* app)
 			descriptor_set_writes[j].dstSet = pipeline->descriptor_sets[i];
 		vkUpdateDescriptorSets(device->device, binding_count, descriptor_set_writes, 0, NULL);
 	}
-	free(light_texture_writes);
 	free((void*) descriptor_set_writes[material_write_index].pImageInfo);
 
 	// Prepare defines for the shader
+	brdf_model_t brdf = app->render_settings.brdf_model;
 	sampling_strategies_t sampling_strategies = app->render_settings.sampling_strategies;
 	mis_heuristic_t mis_heuristic = app->render_settings.mis_heuristic;
-	sample_polygon_technique_t polygon_technique = app->render_settings.polygon_sampling_technique;
+	sample_line_technique_t line_technique = app->render_settings.line_sampling_technique;
 	error_display_t error_display = app->render_settings.error_display;
 	VkBool32 output_linear_rgb = swapchain->format == VK_FORMAT_R8G8B8A8_SRGB || swapchain->format == VK_FORMAT_B8G8R8A8_SRGB;
-	uint32_t min_polygonal_light_vertex_count = get_min_polygonal_light_vertex_count(&app->scene_specification);
-	uint32_t max_polygonal_light_vertex_count = get_max_polygonal_light_vertex_count(&app->scene_specification);
-	uint32_t max_polygon_vertex_count = get_max_polygon_vertex_count(&app->scene_specification, &app->render_settings);
 	uint32_t error_index = 0;
 	VkBool32 error_display_diffuse = VK_FALSE;
 	VkBool32 error_display_specular = VK_FALSE;
@@ -742,49 +551,36 @@ int create_shading_pass(shading_pass_t* pass, application_t* app)
 		error_display_diffuse = VK_TRUE;  error_index = 1;  break;
 	case error_display_specular_backward_scaled:
 		error_display_specular = VK_TRUE;  error_index = 1;  break;
-	case error_display_diffuse_forward:
-		error_display_diffuse = VK_TRUE;  error_index = 2;  break;
-	case error_display_specular_forward:
-		error_display_specular = VK_TRUE;  error_index = 2;  break;
 	default:
 		break;
 	};
 	char* defines[] = {
 		format_uint("MATERIAL_COUNT=%u", (uint32_t) scene->materials.material_count),
-		format_uint("POLYGONAL_LIGHT_COUNT=%u", app->scene_specification.polygonal_light_count),
-		format_uint("POLYGONAL_LIGHT_ARRAY_SIZE=%u", (app->scene_specification.polygonal_light_count > 0) ? app->scene_specification.polygonal_light_count : 1),
-		format_uint("POLYGONAL_LIGHT_COUNT_CLAMPED=%u", (app->scene_specification.polygonal_light_count < 33) ? app->scene_specification.polygonal_light_count : 33),
-		format_uint("LIGHT_TEXTURE_COUNT=%u", app->light_textures.image_count),
-		format_uint("MIN_POLYGON_VERTEX_COUNT_BEFORE_CLIPPING=%u", min_polygonal_light_vertex_count),
-		format_uint("MAX_POLYGONAL_LIGHT_VERTEX_COUNT=%u", max_polygonal_light_vertex_count),
-		format_uint("MAX_POLYGON_VERTEX_COUNT=%u", max_polygon_vertex_count),
+		format_uint("LINEAR_LIGHT_COUNT=%u", app->scene_specification.linear_light_count),
+		format_uint("LINEAR_LIGHT_ARRAY_SIZE=%u", (app->scene_specification.linear_light_count > 0) ? app->scene_specification.linear_light_count : 1),
+		format_uint("LINEAR_LIGHT_COUNT_CLAMPED=%u", (app->scene_specification.linear_light_count < 33) ? app->scene_specification.linear_light_count : 33),
+		format_uint("BRDF_LAMBERTIAN_DIFFUSE=%u", brdf == brdf_lambertian_diffuse),
+		format_uint("BRDF_DISNEY_DIFFUSE=%u", brdf == brdf_disney_diffuse),
+		format_uint("BRDF_FROSTBITE_DIFFUSE_SPECULAR=%u", brdf == brdf_frostbite_diffuse_specular),
 		format_uint("SAMPLE_COUNT=%u", app->render_settings.sample_count),
 		format_uint("SAMPLE_COUNT_CLAMPED=%u", (app->render_settings.sample_count < 33) ? app->render_settings.sample_count : 33),
+		format_uint("USE_JITTERED_UNIFORM=%u", app->render_settings.use_jittered_uniform),
 		format_uint("TRACE_SHADOW_RAYS=%u", pass->use_ray_tracing),
-		format_uint("SHOW_POLYGONAL_LIGHTS=%u", app->render_settings.show_polygonal_lights),
+		format_uint("SHOW_LINEAR_LIGHTS=%u", app->render_settings.show_linear_lights),
 		format_uint("SAMPLING_STRATEGIES_DIFFUSE_ONLY=%u", sampling_strategies == sampling_strategies_diffuse_only),
-		format_uint("SAMPLING_STRATEGIES_DIFFUSE_GGX_MIS=%u", sampling_strategies == sampling_strategies_diffuse_ggx_mis),
-		format_uint("SAMPLING_STRATEGIES_DIFFUSE_SPECULAR_SEPARATELY=%u", sampling_strategies == sampling_strategies_diffuse_specular_separately),
 		format_uint("SAMPLING_STRATEGIES_DIFFUSE_SPECULAR_MIS=%u", sampling_strategies == sampling_strategies_diffuse_specular_mis),
-		format_uint("SAMPLING_STRATEGIES_DIFFUSE_SPECULAR_RANDOM=%u", sampling_strategies == sampling_strategies_diffuse_specular_random),
 		format_uint("MIS_HEURISTIC_BALANCE=%u", mis_heuristic == mis_heuristic_balance),
 		format_uint("MIS_HEURISTIC_POWER=%u", mis_heuristic == mis_heuristic_power),
 		format_uint("MIS_HEURISTIC_WEIGHTED=%u", mis_heuristic == mis_heuristic_weighted),
 		format_uint("MIS_HEURISTIC_OPTIMAL_CLAMPED=%u", mis_heuristic == mis_heuristic_optimal_clamped),
-		format_uint("MIS_HEURISTIC_OPTIMAL=%u", mis_heuristic == mis_heuristic_optimal),
-		format_uint("SAMPLE_POLYGON_BASELINE=%u", polygon_technique == sample_polygon_baseline),
-		format_uint("SAMPLE_POLYGON_AREA_TURK=%u", polygon_technique == sample_polygon_area_turk),
-		format_uint("SAMPLE_POLYGON_SOLID_ANGLE_ARVO=%u", polygon_technique == sample_polygon_solid_angle_arvo),
-		format_uint("SAMPLE_POLYGON_RECTANGLE_SOLID_ANGLE_URENA=%u", polygon_technique == sample_polygon_rectangle_solid_angle_urena),
-		format_uint("SAMPLE_POLYGON_SOLID_ANGLE=%u", polygon_technique == sample_polygon_solid_angle),
-		format_uint("SAMPLE_POLYGON_CLIPPED_SOLID_ANGLE=%u", polygon_technique == sample_polygon_clipped_solid_angle),
-		format_uint("SAMPLE_POLYGON_BILINEAR_COSINE_WARP_HART=%u", polygon_technique == sample_polygon_bilinear_cosine_warp_hart),
-		format_uint("SAMPLE_POLYGON_BILINEAR_COSINE_WARP_CLIPPING_HART=%u", polygon_technique == sample_polygon_bilinear_cosine_warp_clipping_hart),
-		format_uint("SAMPLE_POLYGON_BIQUADRATIC_COSINE_WARP_HART=%u", polygon_technique == sample_polygon_biquadratic_cosine_warp_hart),
-		format_uint("SAMPLE_POLYGON_BIQUADRATIC_COSINE_WARP_CLIPPING_HART=%u", polygon_technique == sample_polygon_biquadratic_cosine_warp_clipping_hart),
-		format_uint("SAMPLE_POLYGON_PROJECTED_SOLID_ANGLE_ARVO=%u", polygon_technique == sample_polygon_projected_solid_angle_arvo),
-		format_uint("SAMPLE_POLYGON_PROJECTED_SOLID_ANGLE=%u", polygon_technique == sample_polygon_projected_solid_angle || polygon_technique == sample_polygon_projected_solid_angle_biased),
-		copy_string((polygon_technique == sample_polygon_projected_solid_angle_biased) ? "USE_BIASED_PROJECTED_SOLID_ANGLE_SAMPLING" : "DONT_USE_BIASED_PROJECTED_SOLID_ANGLE_SAMPLING"),
+		format_uint("SAMPLE_LINE_BASELINE=%u", line_technique == sample_line_baseline),
+		format_uint("SAMPLE_LINE_AREA=%u", line_technique == sample_line_area),
+		format_uint("SAMPLE_LINE_SOLID_ANGLE=%u", line_technique == sample_line_solid_angle),
+		format_uint("SAMPLE_LINE_CLIPPED_SOLID_ANGLE=%u", line_technique == sample_line_clipped_solid_angle),
+		format_uint("SAMPLE_LINE_LINEAR_COSINE_WARP_CLIPPING_HART=%u", line_technique == sample_line_linear_cosine_warp_clipping_hart),
+		format_uint("SAMPLE_LINE_QUADRATIC_COSINE_WARP_CLIPPING_HART=%u", line_technique == sample_line_quadratic_cosine_warp_clipping_hart),
+		format_uint("SAMPLE_LINE_PROJECTED_SOLID_ANGLE_LI=%u", line_technique == sample_line_projected_solid_angle_li),
+		format_uint("SAMPLE_LINE_PROJECTED_SOLID_ANGLE=%u", line_technique == sample_line_projected_solid_angle),
 		format_uint("ERROR_DISPLAY_DIFFUSE=%u", error_display_diffuse),
 		format_uint("ERROR_DISPLAY_SPECULAR=%u", error_display_specular),
 		format_uint("ERROR_INDEX=%u", error_index),
@@ -1781,7 +1577,6 @@ void destroy_application(application_t* app) {
 	destroy_geometry_pass(&app->geometry_pass, &app->device);
 	destroy_render_pass(&app->render_pass, &app->device);
 	destroy_render_targets(&app->render_targets, &app->device);
-	destroy_light_textures(&app->light_textures, &app->device);
 	destroy_constant_buffers(&app->constant_buffers, &app->device);
 	destroy_noise_table(&app->noise_table, &app->device);
 	destroy_ltc_table(&app->ltc_table, &app->device);
@@ -1814,7 +1609,7 @@ int update_application(application_t* app, const application_updates_t* update_i
 	}
 	// Return early, if there is nothing to update
 	if (!update.startup && !update.recreate_swapchain && !update.reload_shaders
-		&& !update.quick_load && !update.update_light_count && !update.update_light_textures
+		&& !update.quick_load && !update.update_light_count
 		&& !update.reload_scene && !update.change_shading && !update.regenerate_noise)
 		return 0;
 	// Perform a quick load
@@ -1828,7 +1623,6 @@ int update_application(application_t* app, const application_updates_t* update_i
 	VkBool32 render_targets = update.startup;
 	VkBool32 render_pass = update.startup;
 	VkBool32 constant_buffers = update.startup | update.update_light_count | update.change_shading;
-	VkBool32 light_textures = update.startup | update.reload_scene | update.update_light_count | update.update_light_textures;
 	VkBool32 geometry_pass = update.startup | update.reload_shaders;
 	VkBool32 shading_pass = update.startup | update.change_shading | update.reload_shaders;
 	VkBool32 interface_pass = update.startup | update.reload_shaders;
@@ -1841,7 +1635,7 @@ int update_application(application_t* app, const application_updates_t* update_i
 		render_pass |= swapchain | render_targets;
 		constant_buffers |= swapchain;
 		geometry_pass |= swapchain | scene | constant_buffers | render_targets;
-		shading_pass |= swapchain | noise | ltc_table | scene | render_targets | constant_buffers | light_textures | geometry_pass | shading_pass | interface_pass | frame_queue;
+		shading_pass |= swapchain | noise | ltc_table | scene | render_targets | constant_buffers | geometry_pass | shading_pass | interface_pass | frame_queue;
 		interface_pass |= swapchain | render_targets;
 		frame_queue |= swapchain;
 	}
@@ -1851,7 +1645,6 @@ int update_application(application_t* app, const application_updates_t* update_i
 	if (interface_pass) destroy_interface_pass(&app->interface_pass, &app->device);
 	if (shading_pass) destroy_shading_pass(&app->shading_pass, &app->device);
 	if (geometry_pass) destroy_geometry_pass(&app->geometry_pass, &app->device);
-	if (light_textures) destroy_light_textures(&app->light_textures, &app->device);
 	if (constant_buffers) destroy_constant_buffers(&app->constant_buffers, &app->device);
 	if (render_pass) destroy_render_pass(&app->render_pass, &app->device);
 	if (render_targets) destroy_render_targets(&app->render_targets, &app->device);
@@ -1876,7 +1669,6 @@ int update_application(application_t* app, const application_updates_t* update_i
 		|| (render_targets && create_render_targets(&app->render_targets, &app->device, &app->swapchain))
 		|| (render_pass && create_render_pass(&app->render_pass, &app->device, &app->swapchain, &app->render_targets))
 		|| (constant_buffers && create_constant_buffers(&app->constant_buffers, &app->device, &app->swapchain, &app->scene_specification, &app->render_settings))
-		|| (light_textures && create_and_assign_light_textures(&app->light_textures, &app->device, &app->scene_specification))
 		|| (geometry_pass && create_geometry_pass(&app->geometry_pass, &app->device, &app->swapchain, &app->scene, &app->constant_buffers, &app->render_targets, &app->render_pass))
 		|| (shading_pass && create_shading_pass(&app->shading_pass, app))
 		|| (interface_pass && create_interface_pass(&app->interface_pass, &app->device, app->imgui, &app->swapchain, &app->render_targets, &app->render_pass))
@@ -2156,35 +1948,14 @@ void write_constants(void* data, application_t* app) {
 			for (uint32_t k = 0; k != 4; ++k)
 				constants.pixel_to_ray_direction_world_space[i][j] += projection_to_world_space_no_translation[i][k] * pixel_to_ray_direction_projection_space[k][j];
 	memcpy(data, &constants, sizeof(constants));
-	size_t offset = sizeof(per_frame_constants_t);
-	// Write polygonal lights
-	uint32_t max_vertex_count = get_max_polygonal_light_vertex_count(&app->scene_specification);
-	for (uint32_t i = 0; i != app->scene_specification.polygonal_light_count; ++i) {
-		polygonal_light_t* light = &app->scene_specification.polygonal_lights[i];
-		// Ensure that redundant attributes (including the texture index) are
-		// up to date
-		update_polygonal_light(light);
-		create_and_assign_light_textures(NULL, &app->device, &app->scene_specification);
-		// Write fixed-size data
-		memcpy(((char*) data) + offset, light, POLYGONAL_LIGHT_FIXED_CONSTANT_BUFFER_SIZE);
-		offset += POLYGONAL_LIGHT_FIXED_CONSTANT_BUFFER_SIZE;
-		// Write vertices
-		float* vertex_data[2] = { light->vertices_plane_space, light->vertices_world_space };
-		for (uint32_t j = 0; j != 2; ++j) {
-			memcpy(((char*) data) + offset, vertex_data[j], sizeof(float) * 4 * light->vertex_count);
-			if (light->vertex_count < max_vertex_count)
-				// Repeat the first vertex
-				memcpy(((char*) data) + offset + sizeof(float) * 4 * light->vertex_count, vertex_data[j], sizeof(float) * 4);
-			offset += sizeof(float) * 4 * max_vertex_count;
-		}
-		// Write fan areas, repeating the last entry at the end
-		memcpy(((char*) data) + offset, light->fan_areas, sizeof(float) * 4 * (light->vertex_count - 2));
-		offset += sizeof(float) * 4 * (light->vertex_count - 2);
-		for (uint32_t i = light->vertex_count; i != max_vertex_count; ++i) {
-			memcpy(((char*) data) + offset, light->fan_areas + sizeof(float) * 4 * (light->vertex_count - 3), sizeof(float) * 4);
-			offset += sizeof(float) * 4;
-		}
-	}
+	// Write linear lights
+	for (uint32_t i = 0; i != app->scene_specification.linear_light_count; ++i)
+		update_linear_light(&app->scene_specification.linear_lights[i]);
+	memcpy(
+		((char*) data) + sizeof(per_frame_constants_t),
+		app->scene_specification.linear_lights,
+		sizeof(linear_light_t) * app->scene_specification.linear_light_count
+	);
 }
 
 

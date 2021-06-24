@@ -7,6 +7,8 @@ target_sources(vulkan_renderer PRIVATE
 	frame_timer.h
 	imgui_vulkan.cpp
 	imgui_vulkan.h
+	linear_light.c
+	linear_light.h
 	ltc_table.c
 	ltc_table.h
 	main.c
@@ -14,8 +16,6 @@ target_sources(vulkan_renderer PRIVATE
 	math_utilities.h
 	noise_table.h
 	noise_table.c
-	polygonal_light.c
-	polygonal_light.h
 	scene.c
 	scene.h
 	stb_image_write.h
@@ -30,14 +30,12 @@ target_sources(vulkan_renderer PRIVATE
 	shaders/cubic_solver.glsl
 	shaders/imgui.frag.glsl
 	shaders/imgui.vert.glsl
+	shaders/line_sampling.glsl
+	shaders/linear_light_utility.glsl
 	shaders/ltc_utility.glsl
 	shaders/math_constants.glsl
 	shaders/mesh_quantization.glsl
 	shaders/noise_utility.glsl
-	shaders/polygon_sampling.glsl
-	shaders/polygon_sampling_related_work.glsl
-	shaders/polygon_clipping.glsl
-	shaders/polygonal_light_utility.glsl
 	shaders/shading_pass.frag.glsl
 	shaders/shading_pass.vert.glsl
 	shaders/shared_constants.glsl

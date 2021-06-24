@@ -30,10 +30,6 @@ VkExtent3D get_default_noise_resolution(noise_type_t noise_type) {
 		result.width = result.height = 128;
 		result.depth = 1;
 		break;
-	case noise_type_ahmed:
-		result.width = result.height = 256;
-		result.depth = 64;
-		break;
 	default:
 		result.width = result.height = 256;
 		result.depth = 64;

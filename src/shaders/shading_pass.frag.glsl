@@ -24,9 +24,8 @@
 #include "noise_utility.glsl"
 #include "brdfs.glsl"
 #include "mesh_quantization.glsl"
-//#include "polygon_sampling.glsl" via polygon_sampling_related_work.glsl
-#include "polygon_sampling_related_work.glsl"
-#include "polygon_clipping.glsl"
+//#include "line_sampling.glsl" via line_sampling_related_work.glsl
+#include "line_sampling_related_work.glsl"
 #include "shared_constants.glsl"
 #include "srgb_utility.glsl"
 #include "unrolling.glsl"
@@ -55,14 +54,10 @@ layout (binding = 4, input_attachment_index = 0) uniform usubpassInput g_visibil
 //! Textures (base color, specular, normal consecutively) for each material
 layout (binding = 5) uniform sampler2D g_material_textures[3 * MATERIAL_COUNT];
 
-//! Textures for each polygonal light. These can be plane space textures, light
-//! probes or IES profiles
-layout (binding = 8) uniform sampler2D g_light_textures[LIGHT_TEXTURE_COUNT];
-
 //! The top-level acceleration structure that contains all shadow-casting
 //! geometry
 #if TRACE_SHADOW_RAYS
-layout(binding = 9, set = 0) uniform accelerationStructureEXT g_top_level_acceleration_structure;
+layout(binding = 8, set = 0) uniform accelerationStructureEXT g_top_level_acceleration_structure;
 #endif
 
 //! The pixel index with origin in the upper left corner
@@ -113,13 +108,57 @@ vec3 error_to_color(float error) {
 }
 
 
+/*! Gets the random numbers for the next sample. It assumes that a single one-
+	dimensional integral is approximated using SAMPLE_COUNT samples.
+	\param noise The previously used sample (if sample_index > 0), which is
+		overwritten with the next sample.
+	\param sample_index An index from 0 to SAMPLE_COUNT - 1. You have to invoke
+		this method exactly once with each index in increasing order.
+	\param accessor An accessor for a noise table. With jittered uniform
+		sampling, it is only used if sample_index == 0, otherwise it is used
+		for each sample.*/
+void get_sample_noise_1(inout float noise, uint sample_index, inout noise_accessor_t accessor) {
+#if USE_JITTERED_UNIFORM
+	if (sample_index == 0)
+		noise = get_noise_1(accessor) * (1.0f / SAMPLE_COUNT);
+	else
+		noise += 1.0f / SAMPLE_COUNT;
+#else
+	noise = get_noise_1(accessor);
+#endif
+}
+
+//! Variant of get_sample_noise_1() that provides access to two random numbers
+//! at once
+void get_sample_noise_2(inout vec2 noise, uint sample_index, inout noise_accessor_t accessor) {
+#if USE_JITTERED_UNIFORM
+	if (sample_index == 0)
+		noise = get_noise_2(accessor) * (1.0f / SAMPLE_COUNT);
+	else
+		noise += vec2(1.0f / SAMPLE_COUNT);
+#else
+	noise = get_noise_2(accessor);
+#endif
+}
+
+
+//! Assumes that the given ray intersects the given linear light and computes a
+//! t such that ray_origin + t * ray_direction is a point on the linear light
+float get_ray_line_intersection(linear_light_t linear_light, vec3 ray_origin, vec3 ray_direction) {
+	vec3 line_begin_offset = ray_origin - linear_light.begin;
+	// Solve the problem twice and take the solution that looks more stable
+	vec2 kernel_0 = cross(vec3(ray_direction.x, linear_light.line_direction.x, line_begin_offset.x), vec3(ray_direction.y, linear_light.line_direction.y, line_begin_offset.y)).xz;
+	vec2 kernel_1 = cross(vec3(ray_direction.x, linear_light.line_direction.x, line_begin_offset.x), vec3(ray_direction.z, linear_light.line_direction.z, line_begin_offset.z)).xz;
+	return (abs(kernel_0.y) > abs(kernel_1.y)) ? (kernel_0.x / kernel_0.y) : (kernel_1.x / kernel_1.y);
+}
+
 /*! If shadow rays are enabled, this function traces a shadow ray towards the
-	given polygonal light and updates visibility accordingly. If visibility is
+	given linear light and updates visibility accordingly. If visibility is
 	false already, no ray is traced. The ray direction must be normalized.*/
-void get_polygon_visibility(inout bool visibility, vec3 sampled_dir, vec3 shading_position, polygonal_light_t polygonal_light) {
+void get_line_visibility(inout bool visibility, vec3 ray_direction, vec3 shading_position, linear_light_t linear_light) {
 #if TRACE_SHADOW_RAYS
 	if (visibility) {
-		float max_t = -dot(vec4(shading_position, 1.0f), polygonal_light.plane) / dot(sampled_dir, polygonal_light.plane.xyz);
+		float max_t = get_ray_line_intersection(linear_light, shading_position, ray_direction);
 		float min_t = 1.0e-3f;
 		// Perform a ray query and wait for it to finish. One call to
 		// rayQueryProceedEXT() should be enough because of
@@ -127,7 +166,7 @@ void get_polygon_visibility(inout bool visibility, vec3 sampled_dir, vec3 shadin
 		rayQueryEXT ray_query;
 		rayQueryInitializeEXT(ray_query, g_top_level_acceleration_structure,
 			gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT | gl_RayFlagsSkipClosestHitShaderEXT,
-			0xFF, shading_position, min_t, sampled_dir, max_t);
+			0xFF, shading_position, min_t, ray_direction, max_t);
 		rayQueryProceedEXT(ray_query);
 		// Update the visibility
 		bool occluder_hit = (rayQueryGetIntersectionTypeEXT(ray_query, true) != gl_RayQueryCommittedIntersectionNoneEXT);
@@ -137,94 +176,25 @@ void get_polygon_visibility(inout bool visibility, vec3 sampled_dir, vec3 shadin
 }
 
 
-/*! Determines the radiance received from the given direction due to the given
-	polygonal light (ignoring visibility).
-	\param sampled_dir The normalized direction from the shading point to the
-		light source in world space. It must be chosen such that the ray
-		actually intersects the polygon (possibly behind an occluder or below
-		the horizon).
-	\param shading_position The location of the shading point.
-	\param polygonal_light The light source for which the incoming radiance is
-		evaluated.
-	\return Received radiance.*/
-vec3 get_polygon_radiance(vec3 sampled_dir, vec3 shading_position, polygonal_light_t polygonal_light) {
-	vec3 radiance = polygonal_light.surface_radiance;
-	uint technique = polygonal_light.texturing_technique;
-	if (technique != polygon_texturing_none) {
-		vec2 tex_coord;
-		if (technique == polygon_texturing_area) {
-			// Intersect the ray with the plane of the light source
-			float intersection_t = -dot(vec4(shading_position, 1.0f), polygonal_light.plane) / dot(sampled_dir, polygonal_light.plane.xyz);
-			vec3 intersection = shading_position + intersection_t * sampled_dir;
-			// Transform to plane space
-			intersection -= polygonal_light.translation;
-			tex_coord = (transpose(polygonal_light.rotation) * intersection).xy;
-			tex_coord *= vec2(polygonal_light.inv_scaling_x, polygonal_light.inv_scaling_y);
-		}
-		else {
-			vec3 lookup_dir;
-			if (technique == polygon_texturing_ies_profile) {
-				// For IES profiles, we transform to plane space
-				lookup_dir = transpose(polygonal_light.rotation) * sampled_dir;
-				// IES profiles already include this cosine term, so we divide
-				// it out
-				radiance *= 1.0f / abs(lookup_dir.z);
-			}
-			else
-				// This code is designed to be compatible with the coordinate
-				// system used for HDRI Haven light probes
-				lookup_dir = vec3(-sampled_dir.x, sampled_dir.y, sampled_dir.z);
-			// Now we compute spherical coordinates
-			tex_coord.x = atan(lookup_dir.y, lookup_dir.x) * (0.5f * M_INV_PI);
-			tex_coord.y = acos(lookup_dir.z) * M_INV_PI;
-		}
-		radiance *= textureLod(g_light_textures[polygonal_light.texture_index], tex_coord, 0.0f).rgb;
-	}
-	return radiance;
-}
-
-
-/*! Determines the radiance received from the given direction due to the given
-	polygonal light and multiplies it by the BRDF for this direction. If
-	necessary, this function traces a shadow ray to determine visibility.
+/*! Determines the radiance times radius received from the given direction due
+	to the given linear light and multiplies it by the BRDF for this direction.
+	If necessary, this function traces a shadow ray to determine visibility.
 	\param lambert The dot product of the normal vector and the given
 		direction, in case you have use for it outside this function.
 	\param sampled_dir The normalized direction from the shading point to the
 		light source in world space. It must be chosen such that the ray
-		actually intersects the polygon (possibly behind an occluder or below
+		actually intersects the line (possibly behind an occluder or below
 		the horizon).
 	\param shading_data Shading data for the shading point.
-	\param polygonal_light The light source for which the incoming radiance is
+	\param linear_light The light source for which the incoming radiance is
 		evaluated.
-	\param diffuse Whether the diffuse BRDF component is evaluated.
-	\param specular Whether the specular BRDF component is evaluated.
 	\return BRDF times incoming radiance times visibility.*/
-vec3 get_polygon_radiance_visibility_brdf_product(out float out_lambert, vec3 sampled_dir, shading_data_t shading_data, polygonal_light_t polygonal_light, bool diffuse, bool specular) {
+vec3 get_line_radiance_radius_visibility_brdf_product(out float out_lambert, vec3 sampled_dir, shading_data_t shading_data, linear_light_t linear_light) {
 	out_lambert = dot(shading_data.normal, sampled_dir);
 	bool visibility = (out_lambert > 0.0f);
-	get_polygon_visibility(visibility, sampled_dir, shading_data.position, polygonal_light);
-	if (visibility) {
-		vec3 radiance = get_polygon_radiance(sampled_dir, shading_data.position, polygonal_light);
-		return radiance * evaluate_brdf(shading_data, sampled_dir, diffuse, specular);
-	}
-	else
-		return vec3(0.0f);
-}
-
-//! Overload that evaluates diffuse and specular BRDF components
-vec3 get_polygon_radiance_visibility_brdf_product(out float lambert, vec3 sampled_dir, shading_data_t shading_data, polygonal_light_t polygonal_light) {
-	return get_polygon_radiance_visibility_brdf_product(lambert, sampled_dir, shading_data, polygonal_light, true, true);
-}
-
-//! Like get_polygon_radiance_visibility_brdf_product() but always evaluates
-//! both BRDF components and also outputs the visibility term explicitly.
-vec3 get_polygon_radiance_visibility_brdf_product(out bool out_visibility, vec3 sampled_dir, shading_data_t shading_data, polygonal_light_t polygonal_light) {
-	out_visibility = (dot(shading_data.normal, sampled_dir) > 0.0f);
-	get_polygon_visibility(out_visibility, sampled_dir, shading_data.position, polygonal_light);
-	if (out_visibility) {
-		vec3 radiance = get_polygon_radiance(sampled_dir, shading_data.position, polygonal_light);
-		return radiance * evaluate_brdf(shading_data, sampled_dir, true, true);
-	}
+	get_line_visibility(visibility, sampled_dir, shading_data.position, linear_light);
+	if (visibility)
+		return linear_light.radiance_times_radius * evaluate_brdf(shading_data, sampled_dir);
 	else
 		return vec3(0.0f);
 }
@@ -252,8 +222,8 @@ float get_mis_weight_over_density(float sampled_density, float other_density) {
 
 
 /*! Returns the MIS estimator for the given sample using the currently enabled
-	MIS heuristic. It supports our weighted balance heuristic and optimal MIS.
-	\param visibility true iff the given sample is occluded.
+	MIS heuristic. It supports our weighted balance heuristic and clamped
+	optimal MIS.
 	\param integrand The value of the integrand with respect to solid angle
 		measure at the sampled location.
 	\param sampled_density, other_density See get_mis_weight_over_density().
@@ -266,25 +236,20 @@ float get_mis_weight_over_density(float sampled_density, float other_density) {
 		accurate, it just blends between two MIS heuristics for optimal MIS.
 	\return An unbiased multiple importance sampling estimator. Note that it
 		may be negative when optimal MIS is used.*/
-vec3 get_mis_estimate(bool visibility, vec3 integrand, vec3 sampled_weight, float sampled_density, vec3 other_weight, float other_density, float visibility_estimate) {
+vec3 get_mis_estimate(vec3 integrand, vec3 sampled_weight, float sampled_density, vec3 other_weight, float other_density, float visibility_estimate) {
 #if MIS_HEURISTIC_WEIGHTED
 	vec3 weighted_sum = sampled_weight * sampled_density + other_weight * other_density;
 	return (sampled_weight * integrand) / weighted_sum;
 
-#elif MIS_HEURISTIC_OPTIMAL_CLAMPED || MIS_HEURISTIC_OPTIMAL
+#elif MIS_HEURISTIC_OPTIMAL_CLAMPED
 	float balance_weight_over_density = 1.0f / (sampled_density + other_density);
 	vec3 weighted_sum = sampled_weight * sampled_density + other_weight * other_density;
-#if MIS_HEURISTIC_OPTIMAL_CLAMPED
 	vec3 weighted_weight_over_density = sampled_weight / weighted_sum;
 	vec3 mixed_weight_over_density = vec3(fma(-visibility_estimate, balance_weight_over_density, balance_weight_over_density));
 	mixed_weight_over_density = fma(vec3(visibility_estimate), weighted_weight_over_density, vec3(mixed_weight_over_density));
 	// For visible samples, we use the actual integrand
 	vec3 visible_estimate = mixed_weight_over_density * integrand;
 	return visible_estimate;
-
-#elif MIS_HEURISTIC_OPTIMAL
-	return visibility_estimate * sampled_weight + balance_weight_over_density * (integrand - visibility_estimate * weighted_sum);
-#endif
 
 #else
 	return get_mis_weight_over_density(sampled_density, other_density) * integrand;
@@ -293,419 +258,264 @@ vec3 get_mis_estimate(bool visibility, vec3 integrand, vec3 sampled_weight, floa
 
 
 /*! Returns the Monte Carlo estimate of the lighting contribution of a
-	polygonal light. Most parameters forward to
-	get_polygon_radiance_visibility_brdf_product(). If enabled, this method
-	implements multiple importance sampling with importance sampling of the
-	visible normal distribution. Thus, the given sample must be generated by
-	next event estimation, i.e. as direction towards the light source.
+	linear light. Most parameters forward to
+	get_line_radiance_radius_visibility_brdf_product(). The given sample must
+	be generated by next event estimation, i.e. as direction towards the light
+	source.
 	\param sampled_density The density of sampled_dir with respect to the solid
 		angle measure.
-	\see get_polygon_radiance_visibility_brdf_product() */
-vec3 get_polygonal_light_mis_estimate(vec3 sampled_dir, float sampled_density, shading_data_t shading_data, polygonal_light_t polygonal_light) {
+	\see get_line_radiance_radius_visibility_brdf_product() */
+vec3 get_linear_light_monte_carlo_estimate(vec3 sampled_dir, float sampled_density, shading_data_t shading_data, linear_light_t linear_light) {
 	float lambert;
-	vec3 radiance_times_brdf = get_polygon_radiance_visibility_brdf_product(lambert, sampled_dir, shading_data, polygonal_light);
-
-#if SAMPLING_STRATEGIES_DIFFUSE_ONLY
-
+	vec3 radiance_times_brdf = get_line_radiance_radius_visibility_brdf_product(lambert, sampled_dir, shading_data, linear_light);
 	// If the density is exactly zero, that must also be true for the integrand
 	return (sampled_density > 0.0f) ? (radiance_times_brdf * (lambert / sampled_density)) : vec3(0.0f);
-
-#elif SAMPLING_STRATEGIES_DIFFUSE_GGX_MIS
-
-	float ggx_density = get_ggx_reflected_direction_density(shading_data.lambert_outgoing, shading_data.outgoing, sampled_dir, shading_data.normal, shading_data.roughness);
-	return radiance_times_brdf * lambert * get_mis_weight_over_density(sampled_density, ggx_density);
-
-#else
-	// The method is not suitable when LTC importance sampling is involved
-	return vec3(0.0f);
-#endif
 }
 
 
-/*! Takes samples from the given polygonal light to compute shading. The number
+/*! Takes samples from the given linear light to compute shading. The number
 	of samples and sampling techniques are determined by defines.
 	\return The color that arose from shading.*/
-vec3 evaluate_polygonal_light_shading(shading_data_t shading_data, ltc_coefficients_t ltc, polygonal_light_t polygonal_light, inout noise_accessor_t accessor) {
+vec3 evaluate_linear_light_shading(shading_data_t shading_data, ltc_coefficients_t ltc, linear_light_t linear_light, inout noise_accessor_t accessor) {
 	vec3 result = vec3(0.0f);
 
-#if SAMPLE_POLYGON_BASELINE
-	vec3 corner_offset = polygonal_light.translation - shading_data.position;
+	// If requested, clip the given line and make it relative to the shading
+	// point
+#if SAMPLE_LINE_CLIPPED_SOLID_ANGLE || SAMPLE_LINE_LINEAR_COSINE_WARP_CLIPPING_HART || SAMPLE_LINE_QUADRATIC_COSINE_WARP_CLIPPING_HART || SAMPLE_LINE_PROJECTED_SOLID_ANGLE_LI || (SAMPLE_LINE_PROJECTED_SOLID_ANGLE && SAMPLING_STRATEGIES_DIFFUSE_ONLY)
+	vec3 clipped_begin = linear_light.begin - shading_data.position;
+	vec3 clipped_end;
+	float clipped_length = linear_light.line_length;
+	clip_line(vec3(0.0f), shading_data.normal, clipped_begin, clipped_end, linear_light.line_direction, clipped_length);
+	if (clipped_length <= 0.0f)
+		return vec3(0.0f);
+#endif
+
+#if SAMPLE_LINE_BASELINE
+	vec3 begin_offset = linear_light.begin - shading_data.position;
+	float random_number;
 	RAY_TRACING_FOR_LOOP(i, SAMPLE_COUNT, SAMPLE_COUNT_CLAMPED,
 		// This technique is broken. Its purpose is to make sure that random
 		// numbers are still consumed and the BRDF is still evaluated while the
 		// cost for sampling is negligible. Useful as baseline in run time
 		// measurements.
-		vec2 random_numbers = get_noise_2(accessor);
-		vec3 diffuse_dir = normalize(corner_offset + random_numbers[0] * polygonal_light.rotation[0] + random_numbers[1] * polygonal_light.rotation[1]);
-		result += get_polygonal_light_mis_estimate(diffuse_dir, 1.0f, shading_data, polygonal_light);
+		get_sample_noise_1(random_number, i, accessor);
+		vec3 light_sample = fma(vec3(random_number), linear_light.begin_to_end, begin_offset);
+		vec3 diffuse_dir = normalize(light_sample);
+		result += get_linear_light_monte_carlo_estimate(diffuse_dir, 1.0f, shading_data, linear_light);
 	)
 
-#elif SAMPLE_POLYGON_AREA_TURK
+#elif SAMPLE_LINE_AREA
+	vec3 begin_offset = linear_light.begin - shading_data.position;
+	float random_number;
 	RAY_TRACING_FOR_LOOP(i, SAMPLE_COUNT, SAMPLE_COUNT_CLAMPED,
-		vec3 light_sample = sample_area_polygon_turk(polygonal_light.vertex_count, polygonal_light.vertices_world_space, polygonal_light.fan_areas, get_noise_2(accessor));
-		vec3 diffuse_dir;
-		float density = get_area_sample_density(diffuse_dir, light_sample, shading_data.position, polygonal_light.plane.xyz, polygonal_light.area);
-		result += get_polygonal_light_mis_estimate(diffuse_dir, density, shading_data, polygonal_light);
+		// Sample the light source uniformly by length
+		get_sample_noise_1(random_number, i, accessor);
+		vec3 light_sample = fma(vec3(random_number), linear_light.begin_to_end, begin_offset);
+		float squared_distance = dot(light_sample, light_sample);
+		vec3 diffuse_dir = light_sample * inversesqrt(squared_distance);
+		// Compute the density times radius
+		float lambert_outgoing = dot(linear_light.line_direction, diffuse_dir);
+		lambert_outgoing = sqrt(max(0.0f, fma(-lambert_outgoing, lambert_outgoing, 1.0f)));
+		float density = squared_distance / (2.0f * linear_light.line_length * lambert_outgoing);
+		result += get_linear_light_monte_carlo_estimate(diffuse_dir, density, shading_data, linear_light);
 	)
 
-#elif SAMPLE_POLYGON_RECTANGLE_SOLID_ANGLE_URENA
+#elif SAMPLE_LINE_SOLID_ANGLE
 	// Prepare sampling
-	solid_angle_rectangle_urena_t polygon_diffuse = prepare_solid_angle_rectangle_sampling_urena(
-		polygonal_light.translation, polygonal_light.scaling_x * polygonal_light.rotation[0], polygonal_light.scaling_y * polygonal_light.rotation[1],
-		polygonal_light.scaling_x, polygonal_light.scaling_y, polygonal_light.rotation, shading_data.position);
+	solid_angle_line_t line_diffuse = prepare_solid_angle_line_sampling(
+		linear_light.begin - shading_data.position, linear_light.line_direction, linear_light.line_length);
 	// Perform sampling
+	float random_number;
 	RAY_TRACING_FOR_LOOP(i, SAMPLE_COUNT, SAMPLE_COUNT_CLAMPED,
-		vec3 diffuse_dir = sample_solid_angle_rectangle_urena(polygon_diffuse, get_noise_2(accessor));
-		float density = 1.0f / polygon_diffuse.solid_angle;
-		result += get_polygonal_light_mis_estimate(diffuse_dir, density, shading_data, polygonal_light);
+		get_sample_noise_1(random_number, i, accessor);
+		vec3 diffuse_dir = sample_solid_angle_line(line_diffuse, random_number);
+		float density = 1.0f / line_diffuse.rcp_density;
+		result += get_linear_light_monte_carlo_estimate(diffuse_dir, density, shading_data, linear_light);
 	)
 
-#elif SAMPLE_POLYGON_SOLID_ANGLE_ARVO
+#elif SAMPLE_LINE_CLIPPED_SOLID_ANGLE
 	// Prepare sampling
-	solid_angle_polygon_arvo_t polygon_diffuse = prepare_solid_angle_polygon_sampling_arvo(
-		polygonal_light.vertex_count, polygonal_light.vertices_world_space, shading_data.position);
+	solid_angle_line_t line_diffuse = prepare_solid_angle_line_sampling(
+		clipped_begin, linear_light.line_direction, clipped_length);
 	// Perform sampling
+	float random_number;
 	RAY_TRACING_FOR_LOOP(i, SAMPLE_COUNT, SAMPLE_COUNT_CLAMPED,
-		vec3 diffuse_dir = sample_solid_angle_polygon_arvo(polygon_diffuse, get_noise_2(accessor));
-		float density = 1.0f / polygon_diffuse.solid_angle;
-		result += get_polygonal_light_mis_estimate(diffuse_dir, density, shading_data, polygonal_light);
+		get_sample_noise_1(random_number, i, accessor);
+		vec3 diffuse_dir = sample_solid_angle_line(line_diffuse, random_number);
+		float density = 1.0f / line_diffuse.rcp_density;
+		result += get_linear_light_monte_carlo_estimate(diffuse_dir, density, shading_data, linear_light);
 	)
 
-#elif SAMPLE_POLYGON_SOLID_ANGLE
+#elif SAMPLE_LINE_LINEAR_COSINE_WARP_CLIPPING_HART
 	// Prepare sampling
-	solid_angle_polygon_t polygon_diffuse = prepare_solid_angle_polygon_sampling(
-		polygonal_light.vertex_count, polygonal_light.vertices_world_space, shading_data.position);
+	linear_cosine_warp_line_hart_t line_diffuse = prepare_linear_cosine_warp_line_sampling_hart(
+		shading_data.normal, linear_light.begin - shading_data.position, linear_light.line_direction, linear_light.line_length);
 	// Perform sampling
+	float random_number;
 	RAY_TRACING_FOR_LOOP(i, SAMPLE_COUNT, SAMPLE_COUNT_CLAMPED,
-		vec3 diffuse_dir = sample_solid_angle_polygon(polygon_diffuse, get_noise_2(accessor));
-		float density = 1.0f / polygon_diffuse.solid_angle;
-		result += get_polygonal_light_mis_estimate(diffuse_dir, density, shading_data, polygonal_light);
-	)
-
-#elif SAMPLE_POLYGON_CLIPPED_SOLID_ANGLE \
-	|| SAMPLE_POLYGON_BILINEAR_COSINE_WARP_HART || SAMPLE_POLYGON_BILINEAR_COSINE_WARP_CLIPPING_HART \
-	|| SAMPLE_POLYGON_BIQUADRATIC_COSINE_WARP_HART || SAMPLE_POLYGON_BIQUADRATIC_COSINE_WARP_CLIPPING_HART
-
-	// Transform to shading space and clip if necessary
-	vec3 vertices_shading_space[MAX_POLYGON_VERTEX_COUNT];
-	[[unroll]]
-	for (uint i = 0; i != MAX_POLYGONAL_LIGHT_VERTEX_COUNT; ++i)
-		vertices_shading_space[i] = ltc.world_to_shading_space * vec4(polygonal_light.vertices_world_space[i], 1.0f);
-#if SAMPLE_POLYGON_BILINEAR_COSINE_WARP_HART || SAMPLE_POLYGON_BIQUADRATIC_COSINE_WARP_HART
-	uint clipped_vertex_count = polygonal_light.vertex_count;
-#else
-	uint clipped_vertex_count = clip_polygon(polygonal_light.vertex_count, vertices_shading_space);
-	if (clipped_vertex_count == 0)
-		return vec3(0.0f);
-#endif
-
-#if SAMPLE_POLYGON_CLIPPED_SOLID_ANGLE
-	// Prepare sampling
-	solid_angle_polygon_t polygon_diffuse = prepare_solid_angle_polygon_sampling(
-		clipped_vertex_count, vertices_shading_space, vec3(0.0f));
-	// Perform sampling
-	RAY_TRACING_FOR_LOOP(i, SAMPLE_COUNT, SAMPLE_COUNT_CLAMPED,
-		vec3 diffuse_dir = sample_solid_angle_polygon(polygon_diffuse, get_noise_2(accessor));
-		diffuse_dir = (transpose(ltc.world_to_shading_space) * diffuse_dir).xyz;
-		float density = 1.0f / polygon_diffuse.solid_angle;
-		result += get_polygonal_light_mis_estimate(diffuse_dir, density, shading_data, polygonal_light);
-	)
-
-#elif SAMPLE_POLYGON_BILINEAR_COSINE_WARP_HART || SAMPLE_POLYGON_BILINEAR_COSINE_WARP_CLIPPING_HART
-	// Prepare sampling
-	bilinear_cosine_warp_polygon_hart_t polygon_diffuse = prepare_bilinear_cosine_warp_polygon_sampling_hart(
-		clipped_vertex_count, vertices_shading_space);
-	// Perform sampling
-	RAY_TRACING_FOR_LOOP(i, SAMPLE_COUNT, SAMPLE_COUNT_CLAMPED,
+		get_sample_noise_1(random_number, i, accessor);
 		float density;
-		vec3 diffuse_dir = sample_bilinear_cosine_warp_polygon_hart(density, polygon_diffuse, get_noise_2(accessor));
-		diffuse_dir = (transpose(ltc.world_to_shading_space) * diffuse_dir).xyz;
-		result += get_polygonal_light_mis_estimate(diffuse_dir, density, shading_data, polygonal_light);
+		vec3 diffuse_dir = sample_linear_cosine_warp_line_hart(density, line_diffuse, random_number);
+		result += get_linear_light_monte_carlo_estimate(diffuse_dir, density, shading_data, linear_light);
 	)
 
-#elif SAMPLE_POLYGON_BIQUADRATIC_COSINE_WARP_HART || SAMPLE_POLYGON_BIQUADRATIC_COSINE_WARP_CLIPPING_HART
+#elif SAMPLE_LINE_QUADRATIC_COSINE_WARP_CLIPPING_HART
 	// Prepare sampling
-	biquadratic_cosine_warp_polygon_hart_t polygon_diffuse = prepare_biquadratic_cosine_warp_polygon_sampling_hart(
-		clipped_vertex_count, vertices_shading_space);
+	quadratic_cosine_warp_line_hart_t line_diffuse = prepare_quadratic_cosine_warp_line_sampling_hart(
+		shading_data.normal, linear_light.begin - shading_data.position, linear_light.line_direction, linear_light.line_length);
 	// Perform sampling
+	float random_number;
 	RAY_TRACING_FOR_LOOP(i, SAMPLE_COUNT, SAMPLE_COUNT_CLAMPED,
+		get_sample_noise_1(random_number, i, accessor);
 		float density;
-		vec3 diffuse_dir = sample_biquadratic_cosine_warp_polygon_hart(density, polygon_diffuse, get_noise_2(accessor));
-		diffuse_dir = (transpose(ltc.world_to_shading_space) * diffuse_dir).xyz;
-		result += get_polygonal_light_mis_estimate(diffuse_dir, density, shading_data, polygonal_light);
+		vec3 diffuse_dir = sample_quadratic_cosine_warp_line_hart(density, line_diffuse, random_number);
+		result += get_linear_light_monte_carlo_estimate(diffuse_dir, density, shading_data, linear_light);
 	)
 
-#endif
-
-#elif SAMPLE_POLYGON_PROJECTED_SOLID_ANGLE || SAMPLE_POLYGON_PROJECTED_SOLID_ANGLE_ARVO
-	// If the shading point is on the wrong side of the polygon, we get a
-	// correct winding by flipping the orientation of the shading space
-	float side = dot(vec4(shading_data.position, 1.0f), polygonal_light.plane);
-	[[unroll]]
-	for (uint i = 0; i != 4; ++i) {
-		ltc.world_to_shading_space[i][1] = (side < 0.0f) ? -ltc.world_to_shading_space[i][1] : ltc.world_to_shading_space[i][1];
-		ltc.world_to_cosine_space[i][1] = (side < 0.0f) ? -ltc.world_to_cosine_space[i][1] : ltc.world_to_cosine_space[i][1];
-	}
-
-#if SAMPLING_STRATEGIES_DIFFUSE_ONLY || SAMPLING_STRATEGIES_DIFFUSE_GGX_MIS
-	// Transform to shading space
-	vec3 vertices_shading_space[MAX_POLYGON_VERTEX_COUNT];
-	[[unroll]]
-	for (uint i = 0; i != MAX_POLYGONAL_LIGHT_VERTEX_COUNT; ++i)
-		vertices_shading_space[i] = ltc.world_to_shading_space * vec4(polygonal_light.vertices_world_space[i], 1.0f);
-	// Clip
-	uint clipped_vertex_count = clip_polygon(polygonal_light.vertex_count, vertices_shading_space);
-	if (clipped_vertex_count == 0)
-		return vec3(0.0f);
-
-#if SAMPLE_POLYGON_PROJECTED_SOLID_ANGLE_ARVO
+#elif SAMPLE_LINE_PROJECTED_SOLID_ANGLE_LI
 	// Prepare sampling
-	projected_solid_angle_polygon_arvo_t polygon_diffuse = prepare_projected_solid_angle_polygon_sampling_arvo(
-		clipped_vertex_count, vertices_shading_space);
-	if (polygon_diffuse.projected_solid_angle <= 0.0f)
-		return vec3(0.0f);
+	projected_solid_angle_line_li_t line_diffuse = prepare_projected_solid_angle_line_sampling_li_without_clipping(
+		shading_data.normal, clipped_begin, linear_light.line_direction, clipped_length);
+	// Perform sampling
+	float random_number;
+	RAY_TRACING_FOR_LOOP(i, SAMPLE_COUNT, SAMPLE_COUNT_CLAMPED,
+		get_sample_noise_1(random_number, i, accessor);
+		vec3 diffuse_dir = sample_projected_solid_angle_line_li(line_diffuse, random_number);
+		float density = dot(shading_data.normal, diffuse_dir) / line_diffuse.rcp_density;
+		result += get_linear_light_monte_carlo_estimate(diffuse_dir, density, shading_data, linear_light);
+	)
+
+#elif SAMPLE_LINE_PROJECTED_SOLID_ANGLE && SAMPLING_STRATEGIES_DIFFUSE_ONLY
+
+	// Prepare sampling
+	projected_solid_angle_line_t line_diffuse = prepare_projected_solid_angle_line_sampling_without_clipping(
+		shading_data.normal, clipped_begin, linear_light.line_direction, clipped_length);
 #if ERROR_DISPLAY_DIFFUSE
-	vec2 random_numbers = get_noise_2(accessor);
-	vec3 sampled_dir = sample_projected_solid_angle_polygon_arvo(polygon_diffuse, random_numbers, 3);
-	float error = compute_projected_solid_angle_polygon_sampling_error_arvo(polygon_diffuse, random_numbers, sampled_dir)[ERROR_INDEX];
+	float random_number = get_noise_1(accessor);
+	vec3 sampled_dir = sample_projected_solid_angle_line(line_diffuse, random_number);
+	float error = compute_projected_solid_angle_line_sampling_error(line_diffuse, random_number, sampled_dir);
+	float ltc_brightness = dot(linear_light.radiance_times_radius * shading_data.diffuse_albedo, vec3(0.2126f, 0.7152f, 0.0722f)) * (g_exposure_factor * M_INV_PI * line_diffuse.solid.rcp_density);
+	float error_scales[2] = { 1.0f, ltc_brightness };
+	error *= error_scales[ERROR_INDEX];
 	return error_to_color(error) / g_exposure_factor;
 #else
 	// Perform sampling
+	float random_number;
 	RAY_TRACING_FOR_LOOP(i, SAMPLE_COUNT, SAMPLE_COUNT_CLAMPED,
-		vec3 diffuse_dir = sample_projected_solid_angle_polygon_arvo(polygon_diffuse, get_noise_2(accessor), 3);
-		float density = diffuse_dir.z / polygon_diffuse.projected_solid_angle;
-		diffuse_dir = (transpose(ltc.world_to_shading_space) * diffuse_dir).xyz;
-		result += get_polygonal_light_mis_estimate(diffuse_dir, density, shading_data, polygonal_light);
+		get_sample_noise_1(random_number, i, accessor);
+		vec3 diffuse_dir = sample_projected_solid_angle_line(line_diffuse, random_number);
+		float density = dot(shading_data.normal, diffuse_dir) / line_diffuse.solid.rcp_density;
+		result += get_linear_light_monte_carlo_estimate(diffuse_dir, density, shading_data, linear_light);
 	)
 #endif
 
-#elif SAMPLE_POLYGON_PROJECTED_SOLID_ANGLE
-	// Prepare sampling
-	projected_solid_angle_polygon_t polygon_diffuse = prepare_projected_solid_angle_polygon_sampling(
-		clipped_vertex_count, vertices_shading_space);
-	if (polygon_diffuse.projected_solid_angle <= 0.0f)
+#elif SAMPLE_LINE_PROJECTED_SOLID_ANGLE && SAMPLING_STRATEGIES_DIFFUSE_SPECULAR_MIS
+
+	// Clip the linear light in place
+	clip_line(shading_data.position, shading_data.normal, linear_light.begin, linear_light.end, linear_light.line_direction, linear_light.line_length);
+	if (linear_light.line_length <= 0.0f)
 		return vec3(0.0f);
+	// Prepare diffuse sampling
+	projected_solid_angle_line_t line_diffuse = prepare_projected_solid_angle_line_sampling_without_clipping(
+		shading_data.normal, linear_light.begin - shading_data.position, linear_light.line_direction, linear_light.line_length);
+	if (line_diffuse.solid.rcp_density <= 0.0f)
+		return vec3(0.0f);
+
 #if ERROR_DISPLAY_DIFFUSE
-	vec2 random_numbers = get_noise_2(accessor);
-	vec3 sampled_dir = sample_projected_solid_angle_polygon(polygon_diffuse, random_numbers);
-	float error = compute_projected_solid_angle_polygon_sampling_error(polygon_diffuse, random_numbers, sampled_dir)[ERROR_INDEX];
+	float random_number = get_noise_1(accessor);
+	vec3 sampled_dir = sample_projected_solid_angle_line(line_diffuse, random_number);
+	float error = compute_projected_solid_angle_line_sampling_error(line_diffuse, random_number, sampled_dir);
+	float ltc_brightness = dot(linear_light.radiance_times_radius * shading_data.diffuse_albedo, vec3(0.2126f, 0.7152f, 0.0722f)) * (g_exposure_factor * M_INV_PI * line_diffuse.solid.rcp_density);
+	float error_scales[2] = { 1.0f, ltc_brightness };
+	error *= error_scales[ERROR_INDEX];
 	return error_to_color(error) / g_exposure_factor;
 #else
-	// Perform sampling
-	RAY_TRACING_FOR_LOOP(i, SAMPLE_COUNT, SAMPLE_COUNT_CLAMPED,
-		vec3 diffuse_dir = sample_projected_solid_angle_polygon(polygon_diffuse, get_noise_2(accessor));
-		float density = diffuse_dir.z / polygon_diffuse.projected_solid_angle;
-		diffuse_dir = (transpose(ltc.world_to_shading_space) * diffuse_dir).xyz;
-		result += get_polygonal_light_mis_estimate(diffuse_dir, density, shading_data, polygonal_light);
-	)
-#endif
 
-#endif
-
-#else // Combined diffuse and specular strategies
-
-	// Instruction cache misses are a concern. Thus, we strive to keep the code
-	// small by preparing the diffuse (i==0) and specular (i==1) sampling
-	// strategies in the same loop.
-	projected_solid_angle_polygon_t polygon_diffuse;
-	projected_solid_angle_polygon_t polygon_specular;
-	[[dont_unroll]]
-	for (uint i = 0; i != 2; ++i) {
-		// Local space is either shading space (for the diffuse technique) or
-		// cosine space (for the specular technique)
-		mat4x3 world_to_local_space = (i == 0) ? ltc.world_to_shading_space : ltc.world_to_cosine_space;
-		if (i > 0)
-			// We put this object in the wrong place at first to avoid move
-			// instructions
-			polygon_diffuse = polygon_specular;
-		// Transform to local space
-		vec3 vertices_local_space[MAX_POLYGON_VERTEX_COUNT];
-		[[unroll]]
-		for (uint j = 0; j != MAX_POLYGONAL_LIGHT_VERTEX_COUNT; ++j)
-			vertices_local_space[j] = world_to_local_space * vec4(polygonal_light.vertices_world_space[j], 1.0f);
-		// Clip
-		uint clipped_vertex_count = clip_polygon(polygonal_light.vertex_count, vertices_local_space);
-		if (clipped_vertex_count == 0 && i == 0)
-			// The polygon is completely below the horizon
-			return vec3(0.0f);
-		else if (clipped_vertex_count == 0) {
-			// The linearly transformed cosine is zero on the polygon
-			polygon_specular.projected_solid_angle = 0.0f;
-			break;
-		}
-		// Prepare sampling
-		polygon_specular = prepare_projected_solid_angle_polygon_sampling(clipped_vertex_count, vertices_local_space);
+	// Transform to cosine space
+	linear_light_t transformed_light;
+	float ltc_density_factor;
+	transform_linear_light(transformed_light, ltc_density_factor, linear_light, ltc, shading_data.position);
+	// Clip in cosine space
+	clip_line(vec3(0.0f), vec3(0.0f, 0.0f, 1.0f), transformed_light.begin, transformed_light.end, transformed_light.line_direction, transformed_light.line_length);
+	bool skip_specular = (transformed_light.line_length <= 0.0f);
+	projected_solid_angle_line_t line_specular;
+	if (!skip_specular) {
+		// Prepare specular sampling
+		line_specular = prepare_projected_solid_angle_line_sampling_without_clipping(
+			vec3(0.0f, 0.0f, 1.0f), transformed_light.begin, transformed_light.line_direction, transformed_light.line_length);
+		skip_specular = (line_specular.solid.rcp_density <= 0.0f);
 	}
-	// Even when something remains after clipping, the projected solid angle
-	// may still underflow
-	if (polygon_diffuse.projected_solid_angle == 0.0f)
+	// If the LTC is zero on the whole linear light, use diffuse only
+	if (skip_specular) {
+#if ERROR_DISPLAY_SPECULAR
 		return vec3(0.0f);
-	// Compute the importance of the specular sampling technique using an
-	// LTC-based estimate of unshadowed shading
-	float specular_albedo = ltc.albedo;
-	float specular_weight = specular_albedo * polygon_specular.projected_solid_angle;
-
-#if ERROR_DISPLAY_DIFFUSE
-	vec2 random_numbers = get_noise_2(accessor);
-	vec3 sampled_dir = sample_projected_solid_angle_polygon(polygon_diffuse, random_numbers);
-	float error = compute_projected_solid_angle_polygon_sampling_error(polygon_diffuse, random_numbers, sampled_dir)[ERROR_INDEX];
-	return error_to_color(error) / g_exposure_factor;
-
-#elif ERROR_DISPLAY_SPECULAR
-	if (polygon_specular.projected_solid_angle > 0.0f) {
-		vec2 random_numbers = get_noise_2(accessor);
-		vec3 sampled_dir = sample_projected_solid_angle_polygon(polygon_specular, random_numbers);
-		float error = compute_projected_solid_angle_polygon_sampling_error(polygon_specular, random_numbers, sampled_dir)[ERROR_INDEX];
+#else
+		// Perform sampling
+		float random_number;
+		RAY_TRACING_FOR_LOOP(i, SAMPLE_COUNT, SAMPLE_COUNT_CLAMPED,
+			get_sample_noise_1(random_number, i, accessor);
+			vec3 diffuse_dir = sample_projected_solid_angle_line(line_diffuse, random_number);
+			float density = dot(shading_data.normal, diffuse_dir) / line_diffuse.solid.rcp_density;
+			result += get_linear_light_monte_carlo_estimate(diffuse_dir, density, shading_data, linear_light);
+		)
+#endif
+	}
+	// Otherwise use diffuse and specular sampling with MIS
+	else {
+#if ERROR_DISPLAY_SPECULAR
+		float random_number = get_noise_1(accessor);
+		vec3 sampled_dir = sample_projected_solid_angle_line(line_specular, random_number);
+		float error = compute_projected_solid_angle_line_sampling_error(line_specular, random_number, sampled_dir);
+		float ltc_brightness = dot(linear_light.radiance_times_radius * ltc.albedo, vec3(0.2126f, 0.7152f, 0.0722f)) * (g_exposure_factor * M_INV_PI * line_specular.solid.rcp_density / ltc_density_factor);
+		float error_scales[2] = { 1.0f, ltc_brightness };
+		error *= error_scales[ERROR_INDEX];
 		return error_to_color(error) / g_exposure_factor;
-	}
-	else
-		return vec3(0.0f);
 
-#elif SAMPLING_STRATEGIES_DIFFUSE_SPECULAR_SEPARATELY
-
-	// Take the requested number of samples with both techniques
-	RAY_TRACING_FOR_LOOP(i, SAMPLE_COUNT, SAMPLE_COUNT_CLAMPED,
-		// Take a diffuse sample and accumulate the diffuse BRDF
-		vec3 diffuse_dir = sample_projected_solid_angle_polygon(polygon_diffuse, get_noise_2(accessor));
-		diffuse_dir = (transpose(ltc.world_to_shading_space) * diffuse_dir).xyz;
-		float lambert;
-		vec3 radiance_times_brdf = get_polygon_radiance_visibility_brdf_product(lambert, diffuse_dir, shading_data, polygonal_light, true, false);
-		result += radiance_times_brdf * polygon_diffuse.projected_solid_angle;
-		if (polygon_specular.projected_solid_angle > 0.0f) {
-			// Take a specular sample
-			vec3 dir_cosine_space = sample_projected_solid_angle_polygon(polygon_specular, get_noise_2(accessor));
-			// Transform to shading space and compute the LTC density
-			vec3 dir_shading_space = normalize(ltc.cosine_to_shading_space * dir_cosine_space);
-			float ltc_density = evaluate_ltc_density(ltc, dir_shading_space, 1.0f);
-			// Evaluate radiance and specular BRDF and accumulate in the result
-			float lambert;
-			vec3 radiance_times_brdf = get_polygon_radiance_visibility_brdf_product(lambert, (transpose(ltc.world_to_shading_space) * dir_shading_space).xyz, shading_data, polygonal_light, false, true);
-			result += (dir_shading_space.z <= 0.0f || dir_cosine_space.z <= 0.0f) ? vec3(0.0f) : (radiance_times_brdf * dir_shading_space.z * polygon_specular.projected_solid_angle / ltc_density);
-		}
-	)
-
-#elif SAMPLING_STRATEGIES_DIFFUSE_SPECULAR_MIS
-
-	// Compute the importance of the diffuse sampling technique using the
-	// diffuse albedo and the projected solid angle. Zero albedo is forbidden
-	// because we need a non-zero weight for diffuse samples in parts where the
-	// LTC is zero but the specular BRDF is not. Thus, we clamp.
-	vec3 diffuse_albedo = max(shading_data.diffuse_albedo, vec3(0.01f));
-	vec3 diffuse_weight = diffuse_albedo * polygon_diffuse.projected_solid_angle;
-	uint technique_count = (polygon_specular.projected_solid_angle > 0.0f) ? 2 : 1;
-	float rcp_diffuse_projected_solid_angle = 1.0f / polygon_diffuse.projected_solid_angle;
-	float rcp_specular_projected_solid_angle = 1.0f / polygon_specular.projected_solid_angle;
-	vec3 specular_weight_rgb = vec3(specular_weight);
-	// For optimal MIS, constant factors in the diffuse and specular weight
-	// matter
-#if MIS_HEURISTIC_OPTIMAL
-	vec3 radiance_over_pi = polygonal_light.surface_radiance * M_INV_PI;
-	diffuse_weight *= radiance_over_pi;
-	specular_weight_rgb *= radiance_over_pi;
-#endif
-	// Take the requested number of samples with both techniques
-	RAY_TRACING_FOR_LOOP(i, SAMPLE_COUNT, SAMPLE_COUNT_CLAMPED,
-		// Take the samples
-		vec3 dir_shading_space_diffuse = sample_projected_solid_angle_polygon(polygon_diffuse, get_noise_2(accessor));
-		vec3 dir_shading_space_specular;
-		if (polygon_specular.projected_solid_angle > 0.0f) {
-			dir_shading_space_specular = sample_projected_solid_angle_polygon(polygon_specular, get_noise_2(accessor));
-			dir_shading_space_specular = normalize(ltc.cosine_to_shading_space * dir_shading_space_specular);
-		}
-		[[dont_unroll]]
-		for (uint j = 0; j != technique_count; ++j) {
-			vec3 dir_shading_space = (j == 0) ? dir_shading_space_diffuse : dir_shading_space_specular;
-			if (dir_shading_space.z <= 0.0f) continue;
-			// Compute the densities for the sample with respect to both
-			// sampling techniques (w.r.t. solid angle measure)
-			float diffuse_density = dir_shading_space.z * rcp_diffuse_projected_solid_angle;
-			float specular_density = evaluate_ltc_density(ltc, dir_shading_space, rcp_specular_projected_solid_angle);
-			// Evaluate radiance and BRDF and the integrand as a whole
-			bool visibility;
-			vec3 integrand = dir_shading_space.z * get_polygon_radiance_visibility_brdf_product(visibility, (transpose(ltc.world_to_shading_space) * dir_shading_space).xyz, shading_data, polygonal_light);
-			// Use the appropriate MIS heuristic to turn the sample into a
-			// splat and accummulate
-			if (j == 0 && polygon_specular.projected_solid_angle <= 0.0f)
-				// We only have one sampling technique, so no MIS is needed
-				result += visibility ? (integrand * (1.0f / diffuse_density)) : vec3(0.0f);
-			else if (j == 0)
-				result += get_mis_estimate(visibility, integrand, diffuse_weight, diffuse_density, specular_weight_rgb, specular_density, g_mis_visibility_estimate);
-			else
-				result += get_mis_estimate(visibility, integrand, specular_weight_rgb, specular_density, diffuse_weight, diffuse_density, g_mis_visibility_estimate);
-		}
-	)
-
-#elif SAMPLING_STRATEGIES_DIFFUSE_SPECULAR_RANDOM
-
-	// Compute the importance of the diffuse sampling technique using the
-	// luminance of the diffuse albedo and the projected solid angle
-	const vec3 luminance_weights = vec3(0.21263901f, 0.71516868f, 0.07219232f);
-	float diffuse_albedo = max(dot(shading_data.diffuse_albedo, luminance_weights), 0.01f);
-	float diffuse_weight = diffuse_albedo * polygon_diffuse.projected_solid_angle;
-	float diffuse_ratio = diffuse_weight / (diffuse_weight + specular_weight);
-	// Take the requested number of samples selecting the technique randomly
-	projected_solid_angle_polygon_t polygon_selected;
-	RAY_TRACING_FOR_LOOP(i, SAMPLE_COUNT, SAMPLE_COUNT_CLAMPED,
-		// Select the sampling technique randomly
-		vec2 random_numbers = get_noise_2(accessor);
-		bool specular_selected = random_numbers[0] >= diffuse_ratio;
-		float random_number_offset = specular_selected ? 1.0f : 0.0f;
-		random_numbers[0] = (random_numbers[0] - random_number_offset) / (diffuse_ratio - random_number_offset);
-		polygon_selected = specular_selected ? polygon_specular : polygon_diffuse;
-		// Take a sample
-		vec3 dir_shading_space = sample_projected_solid_angle_polygon(polygon_selected, random_numbers);
-		// Transform back to shading space
-		if (specular_selected)
-			dir_shading_space = normalize(ltc.cosine_to_shading_space * dir_shading_space);
-		// Compute the density for both sampling techniques (each scaled by the
-		// respective weight)
-		float lambert = dir_shading_space.z;
-		float diffuse_density = lambert * diffuse_albedo;
-		float specular_density = evaluate_ltc_density(ltc, dir_shading_space, specular_albedo);
-		float density = (diffuse_density + specular_density) / (diffuse_weight + specular_weight);
-		// Do the shading (in world space)
-		vec3 radiance_times_brdf = get_polygon_radiance_visibility_brdf_product(lambert, (transpose(ltc.world_to_shading_space) * dir_shading_space).xyz, shading_data, polygonal_light);
-		result += (dir_shading_space.z <= 0.0f) ? vec3(0.0f) : (radiance_times_brdf * dir_shading_space.z / density);
-	)
-
-#endif
-#endif
-#endif
-
-#if SAMPLING_STRATEGIES_DIFFUSE_GGX_MIS
-
-	// Transform the outgoing light direction to shading space. By construction
-	// the y-coordinate is zero.
-	vec3 outgoing_shading_space = ltc.world_to_shading_space * vec4(shading_data.outgoing, 0.0f);
-	outgoing_shading_space.y = 0.0f;
-#if SAMPLE_POLYGON_PROJECTED_SOLID_ANGLE || SAMPLE_POLYGON_PROJECTED_SOLID_ANGLE_ARVO
-	float density_factor = 1.0f / polygon_diffuse.projected_solid_angle;
 #else
-	float density_factor = 1.0f / polygon_diffuse.solid_angle;
-#endif
-	// Take the requested number of samples
-	RAY_TRACING_FOR_LOOP(i, SAMPLE_COUNT, SAMPLE_COUNT_CLAMPED,
-		// Take a sample approximately in proportion to the GGX specular BRDF
-		float ggx_density;
-		vec3 dir_shading_space_ggx = sample_ggx_reflected_direction(ggx_density, outgoing_shading_space, shading_data.roughness, get_noise_2(accessor));
-		vec3 dir_world_space_ggx = (transpose(ltc.world_to_shading_space) * dir_shading_space_ggx).xyz;
-		// Check if the ray hits the light source at all. Ideally, we would
-		// gather contributions from all light sources here but doing so has
-		// implications for many aspects of the renderer making the code
-		// considerably more complicated. Since we only need this variant for
-		// comparisons using a single light source, we keep it simple instead.
-		if (dir_shading_space_ggx.z > 0.0f && polygonal_light_ray_intersection(polygonal_light, shading_data.position, vec4(dir_world_space_ggx, 0.0f))) {
-			// Get the incoming radiance, multiplied by the BRDF
+		// Compute the importance of the sampling techniques using their
+		// albedos and projected solid angles. Zero albedo for diffuse is
+		// forbidden because we need a non-zero weight for diffuse samples in
+		// parts where the LTC is zero but the specular BRDF is not. Thus, we
+		// clamp.
+		vec3 diffuse_albedo = max(shading_data.diffuse_albedo, vec3(0.01f));
+		vec3 diffuse_weight = diffuse_albedo * line_diffuse.solid.rcp_density;
+		float rcp_diffuse_projected_solid_angle = 1.0f / line_diffuse.solid.rcp_density;
+		float specular_albedo = ltc.albedo;
+		float specular_weight = specular_albedo * (line_specular.solid.rcp_density / ltc_density_factor);
+		float rcp_specular_projected_solid_angle = ltc_density_factor / line_specular.solid.rcp_density;
+		vec3 specular_weight_rgb = vec3(specular_weight);
+		// Perform sampling
+		vec2 random_numbers;
+		RAY_TRACING_FOR_LOOP(i, SAMPLE_COUNT, SAMPLE_COUNT_CLAMPED,
+			get_sample_noise_2(random_numbers, i, accessor);
+			// Use the diffuse strategy and evaluate both densities
+			vec3 diffuse_dir = sample_projected_solid_angle_line(line_diffuse, random_numbers[0]);
+			float diffuse_density_diffuse_dir = dot(shading_data.normal, diffuse_dir) * rcp_diffuse_projected_solid_angle;
+			float specular_density_diffuse_dir = evaluate_ltc_density_world_space(ltc, diffuse_dir, rcp_specular_projected_solid_angle);
+			// Use the specular strategy, evaluate both densties and transform
+			vec3 specular_dir_cosine_space = sample_projected_solid_angle_line(line_specular, random_numbers[1]);
+			vec3 specular_dir_shading_space;
+			float specular_density_specular_dir = evaluate_ltc_density_cosine_space(specular_dir_shading_space, ltc, specular_dir_cosine_space, rcp_specular_projected_solid_angle);
+			vec3 specular_dir = (transpose(ltc.world_to_shading_space) * specular_dir_shading_space).xyz;
+			float diffuse_density_specular_dir = specular_dir_shading_space.z * rcp_diffuse_projected_solid_angle;
+			// Evaluate radiance and BRDF and the integrand as a whole
 			float lambert;
-			vec3 radiance_times_brdf = get_polygon_radiance_visibility_brdf_product(lambert, dir_world_space_ggx, shading_data, polygonal_light);
-			// Evaluate the density for the polygonal light sampling technique
-			float polygon_density = (SAMPLE_POLYGON_PROJECTED_SOLID_ANGLE != 0) ? (lambert * density_factor) : density_factor;
-			// Now compute the contribution using multiple importance sampling
-			result += radiance_times_brdf * lambert * get_mis_weight_over_density(ggx_density, polygon_density);
-		}
-	)
+			vec3 integrand_diffuse_dir = get_line_radiance_radius_visibility_brdf_product(lambert, diffuse_dir, shading_data, linear_light);
+			integrand_diffuse_dir *= lambert;
+			vec3 integrand_specular_dir = get_line_radiance_radius_visibility_brdf_product(lambert, specular_dir, shading_data, linear_light);
+			integrand_specular_dir *= lambert;
+			// Evaluate the MIS estimates
+			result += get_mis_estimate(integrand_diffuse_dir, diffuse_weight, diffuse_density_diffuse_dir,
+				specular_weight_rgb, specular_density_diffuse_dir, g_mis_visibility_estimate);
+			result += get_mis_estimate(integrand_specular_dir, specular_weight_rgb, specular_density_specular_dir,
+				diffuse_weight, diffuse_density_specular_dir, g_mis_visibility_estimate);
+		)
+#endif
+	}
+#endif
 
 #endif
+
 	return result * (1.0f / SAMPLE_COUNT);
 }
 
@@ -837,13 +647,12 @@ void main() {
 		// Prepare shading data for the visible surface point
 		shading_data = get_shading_data(pixel, int(primitive_index), view_ray_direction);
 		view_ray_end = vec4(shading_data.position, 1.0f);
-#if SHOW_POLYGONAL_LIGHTS
+#if SHOW_LINEAR_LIGHTS
 	}
 	// Display light sources
 	view_ray_direction = normalize(view_ray_direction);
-	for (uint i = 0; i != POLYGONAL_LIGHT_COUNT; ++i)
-		if (polygonal_light_ray_intersection(g_polygonal_lights[i], g_camera_position_world_space, view_ray_end))
-			final_color += get_polygon_radiance(view_ray_direction, g_camera_position_world_space, g_polygonal_lights[i]);
+	for (uint i = 0; i != LINEAR_LIGHT_COUNT; ++i)
+		final_color += render_linear_light(g_linear_lights[i], 0.025f, g_camera_position_world_space, view_ray_direction, view_ray_end);
 	// We only need to shade anything if there is a primitive to shade
 	if (primitive_index != 0xFFFFFFFF) {
 #endif
@@ -852,9 +661,9 @@ void main() {
 		ltc_coefficients_t ltc = get_ltc_coefficients(fresnel_luminance, shading_data.roughness, shading_data.position, shading_data.normal, shading_data.outgoing, g_ltc_constants);
 		// Prepare noise for all sampling decisions
 		noise_accessor_t noise_accessor = get_noise_accessor(pixel, g_noise_resolution_mask, g_noise_texture_index_mask, g_noise_random_numbers);
-		// Shade with all polygonal lights
-		RAY_TRACING_FOR_LOOP(i, POLYGONAL_LIGHT_COUNT, POLYGONAL_LIGHT_COUNT_CLAMPED,
-			final_color += evaluate_polygonal_light_shading(shading_data, ltc, g_polygonal_lights[i], noise_accessor);
+		// Shade with all linear lights
+		RAY_TRACING_FOR_LOOP(i, LINEAR_LIGHT_COUNT, LINEAR_LIGHT_COUNT_CLAMPED,
+			final_color += evaluate_linear_light_shading(shading_data, ltc, g_linear_lights[i], noise_accessor);
 		)
 	}
 	// If there are NaNs or INFs, we want to know. Make them pink.

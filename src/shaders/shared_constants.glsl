@@ -14,8 +14,7 @@
 //  along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 
-#include "polygonal_light_utility.glsl"
-#include "ltc_utility.glsl"
+#include "linear_light_utility.glsl"
 
 layout (std140, row_major, binding = 0) uniform per_frame_constants {
 	//! Bounding-box dependent constants needed for dequantization of positions
@@ -59,8 +58,8 @@ layout (std140, row_major, binding = 0) uniform per_frame_constants {
 	uvec4 g_noise_random_numbers;
 	//! Constants for accessing linearly transformed cosine tables
 	ltc_constants_t g_ltc_constants;
-#ifdef POLYGONAL_LIGHT_ARRAY_SIZE
-	//! The polygonal lights that are illuminating the scene
-	polygonal_light_t g_polygonal_lights[POLYGONAL_LIGHT_ARRAY_SIZE];
+#ifdef LINEAR_LIGHT_ARRAY_SIZE
+	//! The linear lights that are illuminating the scene
+	linear_light_t g_linear_lights[LINEAR_LIGHT_ARRAY_SIZE];
 #endif
 };

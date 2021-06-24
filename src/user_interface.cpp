@@ -77,27 +77,29 @@ void specify_user_interface(application_updates_t* updates, application_t* app, 
 		scene->quick_save_path = copy_string(g_scene_paths[scene_index][3]);
 		updates->quick_load = updates->reload_scene = VK_TRUE;
 	}
+	// BRDF model
+	const char* brdf_models[brdf_model_count];
+	brdf_models[brdf_lambertian_diffuse] = "Lambertian diffuse";
+	brdf_models[brdf_disney_diffuse] = "Disney diffuse";
+	brdf_models[brdf_frostbite_diffuse_specular] = "Frostbite diffuse and specular";
+	if (ImGui::Combo("BRDF", (int*) &settings->brdf_model, brdf_models, COUNT_OF(brdf_models)))
+		updates->change_shading = VK_TRUE;
 
 	// Sampling settings
 	const char* sampling_strategies[sampling_strategies_count];
 	sampling_strategies[sampling_strategies_diffuse_only] = "Diffuse only";
-	sampling_strategies[sampling_strategies_diffuse_ggx_mis] = "Diffuse and GGX with MIS";
-	sampling_strategies[sampling_strategies_diffuse_specular_separately] = "Diffuse and specular separately";
 	sampling_strategies[sampling_strategies_diffuse_specular_mis] = "Diffuse and specular with MIS";
-	sampling_strategies[sampling_strategies_diffuse_specular_random] = "Diffuse or specular chosen randomly";
 	if (ImGui::Combo("Sampling strategies", (int*) &settings->sampling_strategies, sampling_strategies, COUNT_OF(sampling_strategies)))
 		updates->change_shading = VK_TRUE;
-	bool specular_sampling = (settings->sampling_strategies >= sampling_strategies_diffuse_specular_separately);
-	bool ggx_sampling = (settings->sampling_strategies == sampling_strategies_diffuse_ggx_mis);
-	if (settings->sampling_strategies == sampling_strategies_diffuse_ggx_mis || settings->sampling_strategies == sampling_strategies_diffuse_specular_mis) {
+	bool specular_sampling = (settings->sampling_strategies != sampling_strategies_diffuse_only);
+	if (settings->sampling_strategies == sampling_strategies_diffuse_specular_mis) {
 		const char* mis_heuristics[mis_heuristic_count];
 		mis_heuristics[mis_heuristic_balance] = "Balance (Veach)";
 		mis_heuristics[mis_heuristic_power] = "Power (exponent 2, Veach)";
 		mis_heuristics[mis_heuristic_weighted] = "Weighted balance heuristic (ours)";
 		mis_heuristics[mis_heuristic_optimal_clamped] = "Clamped optimal heuristic (ours)";
-		mis_heuristics[mis_heuristic_optimal] = "Optimal heuristic (ours)";
 		uint32_t mis_heuristic_count = COUNT_OF(mis_heuristics);
-		if ((settings->polygon_sampling_technique != sample_polygon_projected_solid_angle && settings->polygon_sampling_technique != sample_polygon_projected_solid_angle_biased) || settings->sampling_strategies != sampling_strategies_diffuse_specular_mis) {
+		if (settings->line_sampling_technique != sample_line_projected_solid_angle) {
 			mis_heuristic_count = mis_heuristic_weighted;
 			if (settings->mis_heuristic >= mis_heuristic_weighted)
 				settings->mis_heuristic = mis_heuristic_power;
@@ -105,94 +107,45 @@ void specify_user_interface(application_updates_t* updates, application_t* app, 
 		if (ImGui::Combo("MIS heuristic", (int*) &settings->mis_heuristic, mis_heuristics, mis_heuristic_count))
 			updates->change_shading = VK_TRUE;
 	}
-	if (settings->sampling_strategies == sampling_strategies_diffuse_specular_mis && (settings->mis_heuristic == mis_heuristic_optimal_clamped || settings->mis_heuristic == mis_heuristic_optimal))
+	if (settings->sampling_strategies == sampling_strategies_diffuse_specular_mis && (settings->mis_heuristic == mis_heuristic_optimal_clamped))
 		ImGui::DragFloat("MIS visibility estimate", &settings->mis_visibility_estimate, 0.01f, 0.0f, 1.0f, "%.2f");
-	const char* polygon_sampling_techniques[sample_polygon_count];
-	polygon_sampling_techniques[sample_polygon_baseline] = "Baseline (zero cost, bogus results)";
-	polygon_sampling_techniques[sample_polygon_area_turk] = "Area sampling (Turk)";
-	polygon_sampling_techniques[sample_polygon_rectangle_solid_angle_urena] = "Rectangle solid angle sampling (Urena)";
-	polygon_sampling_techniques[sample_polygon_solid_angle_arvo] = "Solid angle sampling (Arvo)";
-	polygon_sampling_techniques[sample_polygon_solid_angle] = "Solid angle sampling (ours)";
-	polygon_sampling_techniques[sample_polygon_clipped_solid_angle] = "Clipped solid angle sampling (ours)";
-	polygon_sampling_techniques[sample_polygon_bilinear_cosine_warp_hart] = "Bilinear cosine warp for solid angle sampling (Hart et al.)";
-	polygon_sampling_techniques[sample_polygon_bilinear_cosine_warp_clipping_hart] = "Bilinear cosine warp for clipped solid angle sampling (Hart et al.)";
-	polygon_sampling_techniques[sample_polygon_biquadratic_cosine_warp_hart] = "Biquadratic cosine warp for solid angle sampling (Hart et al.)";
-	polygon_sampling_techniques[sample_polygon_biquadratic_cosine_warp_clipping_hart] = "Biquadratic cosine warp for clipped solid angle sampling (Hart et al.)";
-	polygon_sampling_techniques[sample_polygon_projected_solid_angle_arvo] = "Projected solid angle sampling (Arvo)";
-	polygon_sampling_techniques[sample_polygon_projected_solid_angle] = "Projected solid angle sampling (ours)";
-	polygon_sampling_techniques[sample_polygon_projected_solid_angle_biased] = "Biased projected solid angle sampling (ours)";
-	if (!specular_sampling && !ggx_sampling) {
+	const char* line_sampling_techniques[sample_line_count];
+	line_sampling_techniques[sample_line_baseline] = "Baseline (zero cost, bogus results)";
+	line_sampling_techniques[sample_line_area] = "Area sampling";
+	line_sampling_techniques[sample_line_solid_angle] = "Solid angle sampling";
+	line_sampling_techniques[sample_line_clipped_solid_angle] = "Clipped solid angle sampling";
+	line_sampling_techniques[sample_line_linear_cosine_warp_clipping_hart] = "Linear cosine warp (Hart et al.)";
+	line_sampling_techniques[sample_line_quadratic_cosine_warp_clipping_hart] = "Quadratic cosine warp (Hart et al.)";
+	line_sampling_techniques[sample_line_projected_solid_angle_li] = "Projected solid angle sampling (Li et al.)";
+	line_sampling_techniques[sample_line_projected_solid_angle] = "Our projected solid angle sampling";
+	if (!specular_sampling) {
 		// All sampling techniques are available
-		if (ImGui::Combo("Polygon sampling", (int*) &settings->polygon_sampling_technique, polygon_sampling_techniques, COUNT_OF(polygon_sampling_techniques)))
+		if (ImGui::Combo("Line sampling", (int*) &settings->line_sampling_technique, line_sampling_techniques, COUNT_OF(line_sampling_techniques)))
 			updates->change_shading = VK_TRUE;
 	}
-	else if (ggx_sampling) {
-		// For a few sampling techniques, we have not implemented density
-		// computation independent of sampling, so MIS with the GGX sampling is
-		// not supported
-		sample_polygon_technique_t mis_deny_list[] = {
-			sample_polygon_baseline,
-			sample_polygon_area_turk,
-			sample_polygon_bilinear_cosine_warp_hart,
-			sample_polygon_bilinear_cosine_warp_clipping_hart,
-			sample_polygon_biquadratic_cosine_warp_hart,
-			sample_polygon_biquadratic_cosine_warp_clipping_hart,
-		};
-		// Prepare the list of allowed techniques and remap the current choice
-		const char* allowed_names[sample_polygon_count];
-		sample_polygon_technique_t allowed_techniques[sample_polygon_count];
-		uint32_t allowed_count = 0;
-		int current_choice = 0;
-		for (int i = 0; i != sample_polygon_count; ++i) {
-			bool allowed = true;
-			for (uint32_t j = 0; j != COUNT_OF(mis_deny_list); ++j)
-				allowed &= (mis_deny_list[j] != i);
-			if (allowed) {
-				if (i <= settings->polygon_sampling_technique)
-					current_choice = allowed_count;
-				allowed_names[allowed_count] = polygon_sampling_techniques[i];
-				allowed_techniques[allowed_count] = static_cast<sample_polygon_technique_t>(i);
-				++allowed_count;
-			}
-		}
-		// Create the interface and remap outputs
-		if (ImGui::Combo("Polygon sampling", &current_choice, allowed_names, allowed_count))
-			updates->change_shading = VK_TRUE;
-		settings->polygon_sampling_technique = allowed_techniques[current_choice];
-	}
-	// The specular sampling strategy is only available with our projected
-	// solid angle sampling or its biased variant
 	else {
-		if (settings->polygon_sampling_technique != sample_polygon_projected_solid_angle && settings->polygon_sampling_technique != sample_polygon_projected_solid_angle_biased) {
-			settings->polygon_sampling_technique = sample_polygon_projected_solid_angle;
+		// The specular sampling strategy is only available with our projected
+		// solid angle sampling
+		int zero = 0;
+		ImGui::Combo("Line sampling", (int*) &zero, line_sampling_techniques + sample_line_projected_solid_angle, 1);
+		if (settings->line_sampling_technique != sample_line_projected_solid_angle) {
+			settings->line_sampling_technique = sample_line_projected_solid_angle;
 			updates->change_shading = VK_TRUE;
 		}
-		// Force projected solid angle sampling or its biased variant
-		int technique = settings->polygon_sampling_technique - sample_polygon_projected_solid_angle;
-		if (ImGui::Combo("Polygon sampling", (int*) &technique,  polygon_sampling_techniques + sample_polygon_projected_solid_angle, 2))
-			updates->change_shading = VK_TRUE;
-		settings->polygon_sampling_technique = (technique == 0) ? sample_polygon_projected_solid_angle : sample_polygon_projected_solid_angle_biased;
 	}
-	if (settings->polygon_sampling_technique != sample_polygon_projected_solid_angle && settings->polygon_sampling_technique != sample_polygon_projected_solid_angle_biased
-	&& (settings->sampling_strategies == sampling_strategies_diffuse_specular_mis
-	||  settings->sampling_strategies == sampling_strategies_diffuse_ggx_mis)
+	if (settings->line_sampling_technique != sample_line_projected_solid_angle
+	&& (settings->sampling_strategies == sampling_strategies_diffuse_specular_mis)
 	&& settings->mis_heuristic >= mis_heuristic_weighted)
 		settings->mis_heuristic = mis_heuristic_power;
 	// Whether the error of the sampling procedure should be visualized
-	if ((settings->polygon_sampling_technique == sample_polygon_projected_solid_angle || settings->polygon_sampling_technique == sample_polygon_projected_solid_angle_arvo || settings->polygon_sampling_technique == sample_polygon_projected_solid_angle_biased)
-	&& settings->sampling_strategies != sampling_strategies_diffuse_ggx_mis)
-	{
+	if (settings->line_sampling_technique == sample_line_projected_solid_angle) {
 		const char* error_displays[error_display_count];
 		error_displays[error_display_none] = "Disabled";
 		error_displays[error_display_diffuse_backward] = "Diffuse backward error";
-		error_displays[error_display_diffuse_backward_scaled] = "Diffuse backward error times projected solid angle";
-		error_displays[error_display_diffuse_forward] = "Diffuse forward error";
+		error_displays[error_display_diffuse_backward_scaled] = "Diffuse backward error times diffuse LTC shading";
 		error_displays[error_display_specular_backward] = "Specular backward error";
-		error_displays[error_display_specular_backward_scaled] = "Specular backward error times projected solid angle";
-		error_displays[error_display_specular_forward] = "Specular forward error";
-		int count = (settings->sampling_strategies != sampling_strategies_diffuse_only && settings->sampling_strategies != sampling_strategies_diffuse_ggx_mis) ? error_display_count : error_display_specular_backward;
-		count = (settings->polygon_sampling_technique == sample_polygon_projected_solid_angle_arvo) ? error_display_diffuse_forward : count;
-		if (ImGui::Combo("Error display", (int*) &settings->error_display, error_displays, count))
+		error_displays[error_display_specular_backward_scaled] = "Specular backward error times specular LTC shading";
+		if (ImGui::Combo("Error display", (int*) &settings->error_display, error_displays, COUNT_OF(error_displays)))
 			updates->change_shading = VK_TRUE;
 		if (settings->error_display != error_display_none)
 			ImGui::DragFloat("Min error exponent (base 10)", &settings->error_min_exponent, 0.1f, -9.0f, 0.0f, "%.1f");
@@ -224,112 +177,71 @@ void specify_user_interface(application_updates_t* updates, application_t* app, 
 	noise_types[noise_type_blue_noise_dithered] = "Blue noise dithered (2D)";
 	if (ImGui::Combo("Noise type", (int*) &settings->noise_type, noise_types, noise_type_count))
 		updates->regenerate_noise = VK_TRUE;
+	if (ImGui::Checkbox("Jittered uniform sampling", (bool*) &settings->use_jittered_uniform))
+		updates->change_shading = VK_TRUE;
 	ImGui::Checkbox("Animate noise", (bool*) &settings->animate_noise);
 	// Various rendering settings
-	if (settings->error_display == error_display_none)
+	if (settings->error_display != error_display_diffuse_backward && settings->error_display != error_display_specular_backward)
 		ImGui::DragFloat("Exposure", &settings->exposure_factor, 0.05f, 0.0f, 200.0f, "%.2f");
 	ImGui::DragFloat("Roughness factor", &settings->roughness_factor, 0.01f, 0.0f, 2.0f, "%.2f");
 
-	// Polygonal light controls
-	if (ImGui::Checkbox("Show polygonal lights", (bool*) &settings->show_polygonal_lights))
+	// Linear light controls
+	if (ImGui::Checkbox("Show linear lights", (bool*) &settings->show_linear_lights))
 		updates->change_shading = VK_TRUE;
-	for (uint32_t i = 0; i < scene->polygonal_light_count; ++i) {
-		char* group_name = format_uint("Polygonal light %u", i);
-		polygonal_light_t* light = &scene->polygonal_lights[i];
+	for (uint32_t i = 0; i < scene->linear_light_count; ++i) {
+		char* group_name = format_uint("Linear light %u", i);
+		linear_light_t* light = &scene->linear_lights[i];
 		if (ImGui::TreeNode(group_name)) {
-			float angles_degrees[3] = { light->rotation_angles[0] * 180.0f / M_PI_F, light->rotation_angles[1] * 180.0f / M_PI_F, light->rotation_angles[2] * 180.0f / M_PI_F};
-			ImGui::DragFloat3("Rotation (Euler angles)", angles_degrees, 0.1f, -180.0f, 180.0f);
-			for (uint32_t i = 0; i != 3; ++i)
-				light->rotation_angles[i] = angles_degrees[i] * M_PI_F / 180.0f;
-			float scalings[2] = { light->scaling_x, light->scaling_y };
-			ImGui::DragFloat2("Scaling (xy)", scalings, 0.01f, 0.01f, 100.0f);
-			light->scaling_x = scalings[0];
-			light->scaling_y = scalings[1];
-			ImGui::DragFloat3("Translation (xyz)", light->translation, 0.01f);
-			for (uint32_t i = 0; i != light->vertex_count; ++i) {
-				char* label = format_uint("Vertex %u", i);
-				ImGui::DragFloat2(label, &light->vertices_plane_space[i * 4], 0.01f);
-				free(label);
-			}
-			ImGui::ColorEdit3("Radiant flux", light->radiant_flux);
-			char texture_path[2048] = "";
-			if (light->texture_file_path) strcpy(texture_path, light->texture_file_path);
-			ImGui::InputText("Texture path (*.vkt)", texture_path, sizeof(texture_path));
-			if ((light->texture_file_path == NULL || std::strcmp(texture_path, light->texture_file_path) != 0)
-				&&  (std::strlen(texture_path) == 0
-				||  std::strlen(texture_path) > 4 && std::strcmp(".vkt", texture_path + strlen(texture_path) - 4) == 0))
-			{
-				updates->update_light_textures = VK_TRUE;
-				free(light->texture_file_path);
-				light->texture_file_path = copy_string(texture_path);
-			}
-			const char* polygon_texturing_techniques[polygon_texturing_count];
-			polygon_texturing_techniques[polygon_texturing_none] = "Disabled";
-			polygon_texturing_techniques[polygon_texturing_area] = "Texture";
-			polygon_texturing_techniques[polygon_texturing_portal] = "Light probe";
-			polygon_texturing_techniques[polygon_texturing_ies_profile] = "IES profile";
-			ImGui::Combo("Texture type", (int*) &light->texturing_technique, polygon_texturing_techniques, COUNT_OF(polygon_texturing_techniques));
-			if (ImGui::Button("Add vertex")) {
-				set_polygonal_light_vertex_count(light, light->vertex_count + 1);
-				float* vertices = light->vertices_plane_space;
-				vertices[(light->vertex_count - 1) * 4 + 0] = 0.5f * (vertices[0] + vertices[(light->vertex_count - 2) * 4 + 0]);
-				vertices[(light->vertex_count - 1) * 4 + 1] = 0.5f * (vertices[1] + vertices[(light->vertex_count - 2) * 4 + 1]);
-				updates->update_light_count = VK_TRUE;
-			}
-			if (light->vertex_count > 3) {
-				ImGui::SameLine();
-				if (ImGui::Button("Delete vertex")) {
-					set_polygonal_light_vertex_count(light, light->vertex_count - 1);
-					updates->update_light_count = VK_TRUE;
-				}
-			}
-			if (scene->polygonal_light_count > 0) {
-				ImGui::SameLine();
-				if (ImGui::Button("Delete light"))
-					light->vertex_count = 0;
-			}
+			ImGui::DragFloat3("Begin", light->begin, 0.01f);
+			if (ImGui::Button("Begin at camera"))
+				memcpy(light->begin, scene->camera.position_world_space, sizeof(float) * 3);
+			ImGui::DragFloat3("End", light->end, 0.01f);
+			if (ImGui::Button("End at camera"))
+				memcpy(light->end, scene->camera.position_world_space, sizeof(float) * 3);
+			ImGui::ColorEdit3("Color", light->radiance_times_radius);
+			if (scene->linear_light_count > 0 && ImGui::Button("Delete"))
+				light->line_length = -1.0f;
 			ImGui::TreePop();
 		}
 		free(group_name);
 	}
 	// Go over all lights to see which of them have been deleted
 	uint32_t new_light_index = 0;
-	for (uint32_t i = 0; i < scene->polygonal_light_count; ++i) {
-		if (scene->polygonal_lights[i].vertex_count > 0) {
-			scene->polygonal_lights[new_light_index] = scene->polygonal_lights[i];
+	for (uint32_t i = 0; i < scene->linear_light_count; ++i) {
+		if (scene->linear_lights[i].line_length >= 0.0f) {
+			scene->linear_lights[new_light_index] = scene->linear_lights[i];
 			++new_light_index;
 		}
-		else {
-			destroy_polygonal_light(&scene->polygonal_lights[i]);
+		else
 			updates->update_light_count = VK_TRUE;
-		}
 	}
-	scene->polygonal_light_count = new_light_index;
-	if (ImGui::Button("Add polygonal light")) {
-		// Copy over old polygonal lights
+	scene->linear_light_count = new_light_index;
+	if (ImGui::Button("Add linear light")) {
+		// Copy over old linear lights
 		scene_specification_t old = *scene;
-		scene->polygonal_lights = (polygonal_light_t*) malloc(sizeof(polygonal_light_t) * (scene->polygonal_light_count + 1));
-		memcpy(scene->polygonal_lights, old.polygonal_lights, sizeof(polygonal_light_t) * scene->polygonal_light_count);
-		free(old.polygonal_lights);
+		scene->linear_lights = (linear_light_t*) malloc(sizeof(linear_light_t) * (scene->linear_light_count + 1));
+		memcpy(scene->linear_lights, old.linear_lights, sizeof(linear_light_t) * scene->linear_light_count);
+		free(old.linear_lights);
 		// Create a new one
-		polygonal_light_t default_light;
-		memset(&default_light, 0, sizeof(default_light));
-		default_light.rotation_angles[0] = 0.5f * 3.14159265358f;
-		default_light.scaling_x = default_light.scaling_y = 1.0f;
-		default_light.radiant_flux[0] = default_light.radiant_flux[1] = default_light.radiant_flux[2] = 1.0f;
-		set_polygonal_light_vertex_count(&default_light, 4);
-		default_light.vertices_plane_space[0 * 4 + 0] = 0.0f;
-		default_light.vertices_plane_space[0 * 4 + 1] = 0.0f;
-		default_light.vertices_plane_space[1 * 4 + 0] = 1.0f;
-		default_light.vertices_plane_space[1 * 4 + 1] = 0.0f;
-		default_light.vertices_plane_space[2 * 4 + 0] = 1.0f;
-		default_light.vertices_plane_space[2 * 4 + 1] = 1.0f;
-		default_light.vertices_plane_space[3 * 4 + 0] = 0.0f;
-		default_light.vertices_plane_space[3 * 4 + 1] = 1.0f;
-		scene->polygonal_lights[scene->polygonal_light_count] = default_light;
-		scene->polygonal_light_count = old.polygonal_light_count + 1;
+		linear_light_t default_light;
+		default_light.begin[0] = -1.0f;  default_light.begin[1] = 0.0f;  default_light.begin[2] = 1.0f;
+		default_light.end[0] = 1.0f;  default_light.end[1] = 0.0f;  default_light.end[2] = 1.0f;
+		default_light.radiance_times_radius[0] = default_light.radiance_times_radius[1] = default_light.radiance_times_radius[2] = 10.0f;
+		scene->linear_lights[scene->linear_light_count] = default_light;
+		scene->linear_light_count = old.linear_light_count + 1;
 		updates->update_light_count = VK_TRUE;
 	}
+	/* This button exists for profiling
+	if (scene->linear_light_count == 1 && ImGui::Button("Duplicate 128 times")) {
+		scene->linear_light_count = 128;
+		linear_light_t light = scene->linear_lights[0];
+		free(scene->linear_lights);
+		scene->linear_lights = (linear_light_t*) malloc(sizeof(linear_light_t) * scene->linear_light_count);
+		for (uint32_t i = 0; i != scene->linear_light_count; ++i)
+			scene->linear_lights[i] = light;
+		updates->update_light_count = VK_TRUE;
+	}
+	//*/
 
 	// Show buttons for quick save and quick load
 	if (ImGui::Button("Quick save"))

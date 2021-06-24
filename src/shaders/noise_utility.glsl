@@ -58,7 +58,7 @@ layout (binding = 6) uniform texture2DArray g_noise_table;
 		frames.
   \note The values are not independent across pixels. Values within a returned
   	vector may not be independent dependent on the choice of noise. In fact,
-	some noise types are completely deterministic but still have good
+	the some noise types are completely deterministic but still have good
 	uniformity properties.*/
 vec4 get_noise_sample(uvec2 pixel, uint sample_index, uvec2 resolution_mask, uint texture_index_mask, uvec4 noise_random_numbers) {
 	// Grab some random numbers
@@ -66,7 +66,7 @@ vec4 get_noise_sample(uvec2 pixel, uint sample_index, uvec2 resolution_mask, uin
 	random_numbers.xyz = ((sample_index & 1) != 0) ? random_numbers.yzw : random_numbers.xyz;
 	uint shift = (sample_index & 124) >> 2;
 	uvec2 texture_offset = random_numbers.xy >> shift;
-	uint texture_index = (random_numbers.z + sample_index) & texture_index_mask;
+	uint texture_index = (random_numbers.z >> shift) & texture_index_mask;
 	// Get the noise vector
 	uvec2 sample_location = (pixel + texture_offset) & resolution_mask;
 	return texelFetch(g_noise_table, ivec3(sample_location, texture_index), 0);

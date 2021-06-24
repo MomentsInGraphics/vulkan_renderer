@@ -26,16 +26,16 @@ typedef enum noise_type_e {
 	//! Each channel of each image is a blue noise dither array. Different
 	//! dither arrays are independent.
 	noise_type_blue,
+	//! Number of entries in this enumeration, not a valid type. We have
+	//! moved this up to disable a few noise types that are not shipped with
+	//! the demo.
+	noise_type_count,
 	//! A precomputed table that distributes a Sobol sequence across pixels in
 	//! a way that breaks patterns: Ahmed and Wonka 2020, ToG 39:6,
 	//! Screen-Space Blue-Noise Diffusion of Monte Carlo Sampling Error via
 	//! Hierarchical Ordering of Pixels,
 	//! https://doi.org/10.1145/3414685.3417881
 	noise_type_ahmed,
-	//! Number of entries in this enumeration, not a valid type. We have
-	//! moved this up to disable a few noise types that are not shipped with
-	//! the demo.
-	noise_type_count,
 	//! Each pair of channels of each image is constructed from 4D Sobol
 	//! points. The first two dimensions determine the screen space location,
 	//! the latter two are the sample point in the integrand.
@@ -49,8 +49,8 @@ typedef enum noise_type_e {
 	//! Iliyan Georgiev and Marcos Fajardo, 2016, Blue-noise dithered sampling,
 	//! ACM SIGGRAPH 2016 Talks
 	noise_type_blue_noise_dithered,
-	//! True number of entries in this enumeration, counting disabled noise
-	//! types
+	//! The complete number of entries in this enumeration, if we had not
+	//! excluded variants
 	noise_type_full_count,
 } noise_type_t;
 

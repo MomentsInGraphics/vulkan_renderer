@@ -93,27 +93,28 @@ ltc_coefficients_t get_ltc_coefficients(float fresnel_0, float roughness, vec3 w
 
 /*! Evaluates the density of a linearly transformed cosine.
 	\param ltc Coefficients as produced by get_ltc_coefficients().
-	\param dir_shading_space A normalized direction vector in shading space of
-		the LTC.
+	\param dir_world_space A normalized direction vector in world space.
 	\param rcp_projected_solid_angle The reciprocal of the projected solid
 		angle of the domain in cosine space over which the LTC should be
 		normalized. Pass 1 / pi to get the default normalization of LTCs.
 		Whatever you pass just gets multiplied onto the output.
 	\return The density.*/
-float evaluate_ltc_density(ltc_coefficients_t ltc, vec3 dir_shading_space, float rcp_projected_solid_angle) {
-	vec3 dir_cosine_space = ltc.shading_to_cosine_space * dir_shading_space;
+float evaluate_ltc_density_world_space(ltc_coefficients_t ltc, vec3 dir_world_space, float rcp_projected_solid_angle) {
+	vec3 dir_cosine_space = ltc.world_to_cosine_space * vec4(dir_world_space, 0.0f);
 	float cosine_space_length_squared = dot(dir_cosine_space, dir_cosine_space);
 	float ltc_density = max(0.0f, dir_cosine_space.z) * ltc.shading_to_cosine_space_determinant / (cosine_space_length_squared * cosine_space_length_squared);
 	return ltc_density * rcp_projected_solid_angle;
 }
 
 
-/*! Like evaluate_ltc_density() but inverted. It evaluates the density of a
-	cosine distribution defined in shading space but linearly transformed to
-	cosine space. In other words, it just works with the inverse transform.*/
-float evaluate_ltc_density_inv(ltc_coefficients_t ltc, vec3 dir_cosine_space, float rcp_projected_solid_angle) {
-	vec3 dir_shading_space = ltc.cosine_to_shading_space * dir_cosine_space;
-	float shading_space_length_squared = dot(dir_shading_space, dir_shading_space);
-	float ltc_density = max(0.0f, dir_shading_space.z) / (ltc.shading_to_cosine_space_determinant * shading_space_length_squared * shading_space_length_squared);
+/*! Like evaluate_ltc_density_world_space() but expects a vector in cosine
+	space. As side product, it gives you that vector transformed to shading
+	space (normalized).*/
+float evaluate_ltc_density_cosine_space(out vec3 out_dir_shading_space, ltc_coefficients_t ltc, vec3 dir_cosine_space, float rcp_projected_solid_angle) {
+	out_dir_shading_space = ltc.cosine_to_shading_space * dir_cosine_space;
+	float length_sq = dot(out_dir_shading_space, out_dir_shading_space);
+	float length_rcp = inversesqrt(length_sq);
+	float ltc_density = max(0.0f, dir_cosine_space.z) * ltc.shading_to_cosine_space_determinant * length_sq * length_sq * length_rcp;
+	out_dir_shading_space *= length_rcp;
 	return ltc_density * rcp_projected_solid_angle;
 }

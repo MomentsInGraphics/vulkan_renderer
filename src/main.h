@@ -18,7 +18,7 @@
 #include "vulkan_basics.h"
 #include "noise_table.h"
 #include "camera.h"
-#include "polygonal_light.h"
+#include "linear_light.h"
 #include "ltc_table.h"
 #include "scene.h"
 #include "imgui_vulkan.h"
@@ -35,11 +35,24 @@ typedef struct scene_specification_s {
 	char* quick_save_path;
 	//! The current camera
 	first_person_camera_t camera;
-	//! Number of polygonal lights illuminating the scene
-	uint32_t polygonal_light_count;
-	//! The polygonal lights illuminating the scene
-	polygonal_light_t* polygonal_lights;
+	//! Number of linear lights illuminating the scene
+	uint32_t linear_light_count;
+	//! The linear lights illuminating the scene
+	linear_light_t* linear_lights;
 } scene_specification_t;
+
+//! Settings for how the error of projected solid angle sampling should be
+//! visualized
+typedef enum brdf_model_e {
+	//! A Lambertian diffuse BRDF is used (no specular)
+	brdf_lambertian_diffuse,
+	//! The Disney diffuse BRDF is used (no specular)
+	brdf_disney_diffuse,
+	//! Frostbite BRDF is used (diffuse and specular)
+	brdf_frostbite_diffuse_specular,
+	//! Number of available BRDF models
+	brdf_model_count
+} brdf_model_t;
 
 //! Available methods to combine diffuse and specular samples
 typedef enum sampling_strategies_e {
@@ -47,21 +60,8 @@ typedef enum sampling_strategies_e {
 	//! BRDF is evaluated
 	sampling_strategies_diffuse_only,
 	//! Sampling strategies for diffuse and specular samples are used and
-	//! combined by multiple importance sampling. The specular samples are
-	//! produced in proportion to the GGX specular BRDF by sampling the visible
-	//! normal distribution function (VNDF) but regardless of the geometry of
-	//! the polygonal light, i.e. they may miss it.
-	sampling_strategies_diffuse_ggx_mis,
-	//! The diffuse sampling strategy is used with the diffuse BRDF only and
-	//! the specular sampling strategy is used with the specular BRDF only
-	sampling_strategies_diffuse_specular_separately,
-	//! Sampling strategies for diffuse and specular samples are used and
 	//! combined by multiple importance sampling
 	sampling_strategies_diffuse_specular_mis,
-	//! One of the sampling strategies for diffuse and specular is picked
-	//! randomly with weights proportional to the estimated unshadowed
-	//! contribution
-	sampling_strategies_diffuse_specular_random,
 	//! Number of available sampling strategies
 	sampling_strategies_count
 } sampling_strategies_t;
@@ -76,14 +76,9 @@ typedef enum mis_heuristic_e {
 	//! Our weighted variant of the balance heuristic that incorporates
 	//! estimates of the unshadowed reflected radiance
 	mis_heuristic_weighted,
-	//! Our optimal MIS strategy, clamped to only use non-negative weights
+	//! Our optimal MIS strategy, clamped to only use non-negative weights. It
+	//! is a blend between balance heuristic and weighted balance heuristic.
 	mis_heuristic_optimal_clamped,
-	//! Our optimal MIS strategy. It is a blend between balance heuristic and
-	//! weighted balance heuristic and under some fairly weak assumptions it is
-	//! provably optimal for some degree of visibility. It uses negative
-	//! weights and produces non-zero splats (with zero-mean) for occluded
-	//! rays. This way, it reduces variance a bit but introduces leaking.
-	mis_heuristic_optimal,
 	//! Number of available heuristics
 	mis_heuristic_count
 } mis_heuristic_t;
@@ -98,21 +93,16 @@ typedef enum error_display_e {
 	error_display_diffuse_backward,
 	//! The error of the first sample using the diffuse sampling strategy is
 	//! displayed as error in the first random number, multiplied by the
-	//! projected solid angle of the polygon
+	//! luminance of the diffuse shading estimate provided by LTCs. A luminance
+	//! of one corresponds to saturated pixels.
 	error_display_diffuse_backward_scaled,
-	//! The error of the first sample using the diffuse sampling strategy is
-	//! displayed as error in the sampled direction in radians
-	error_display_diffuse_forward,
 	//! The error of the first sample using the specular sampling strategy is
 	//! displayed as error in the first random number
 	error_display_specular_backward,
 	//! The error of the first sample using the specular sampling strategy is
 	//! displayed as error in the first random number, multiplied by the
-	//! projected solid angle of the polygon
+	//! luminance of the specular shading estimate provided by LTCs
 	error_display_specular_backward_scaled,
-	//! The error of the first sample using the specular sampling strategy is
-	//! displayed as error in the sampled direction in radians
-	error_display_specular_forward,
 	//! Number of available settings
 	error_display_count
 } error_display_t;
@@ -126,6 +116,8 @@ typedef enum bool_override_e {
 
 //! Options that control how the scene will be rendered
 typedef struct render_settings_s {
+	//! The used BRDF model for all surfaces in the scene
+	brdf_model_t brdf_model;
 	//! Constant factors for the overall brightness and surface roughness
 	float exposure_factor, roughness_factor;
 	//! The number of samples used per sampling technique
@@ -137,8 +129,8 @@ typedef struct render_settings_s {
 	//! An estimate of how much each shading point is shadowed. Used as a
 	//! parameter to control optimal multiple importance sampling.
 	float mis_visibility_estimate;
-	//! The technique used to sample polygonal lights
-	sample_polygon_technique_t polygon_sampling_technique;
+	//! The technique used to sample linear lights
+	sample_line_technique_t line_sampling_technique;
 	//! Whether the error of the diffuse or specular sampling strategy should
 	//! be visualized
 	error_display_t error_display;
@@ -146,12 +138,16 @@ typedef struct render_settings_s {
 	float error_min_exponent;
 	//! The type of tabulated noise to use for Monte Carlo integration
 	noise_type_t noise_type;
+	//! Whether to  use jittered uniform sampling or uncorrelated sampling. In
+	//! jittered uniform sampling a single random number is used to offset
+	//! equidistant samples. Only relevant for sample_count > 1.
+	VkBool32 use_jittered_uniform;
 	//! Whether noise should be updated each frame
 	VkBool32 animate_noise;
 	//! Whether ray traced shadows should be used
 	VkBool32 trace_shadow_rays;
 	//! Whether light sources should be rendered
-	VkBool32 show_polygonal_lights;
+	VkBool32 show_linear_lights;
 	//! Whether the user interface should be rendered
 	VkBool32 show_gui;
 	//! Whether vertical synchronization should be used (caps frame rate)
@@ -294,8 +290,6 @@ typedef struct shading_pass_s {
 	pipeline_with_bindings_t pipeline;
 	//! The vertex and fragment shader that implements the shading pass
 	shader_t vertex_shader, fragment_shader;
-	//! The sampler for light textures
-	VkSampler light_texture_sampler;
 } shading_pass_t;
 
 
@@ -437,11 +431,8 @@ typedef struct application_updates_s {
 	VkBool32 recreate_swapchain;
 	//! All shaders need to be recompiled
 	VkBool32 reload_shaders;
-	//! The number of light sources in the scene or the number of vertices in a
-	//! polygonal light source has changed
+	//! The number of light sources in the scene has changed
 	VkBool32 update_light_count;
-	//! A texture of a polygonal light source has changed
-	VkBool32 update_light_textures;
 	//! The scene itself has changed
 	VkBool32 reload_scene;
 	//! Settings that define how shading is performed have changed
@@ -469,7 +460,6 @@ typedef struct application_s {
 	ltc_table_t ltc_table;
 	render_targets_t render_targets;
 	constant_buffers_t constant_buffers;
-	images_t light_textures;
 	geometry_pass_t geometry_pass;
 	shading_pass_t shading_pass;
 	interface_pass_t interface_pass;

@@ -47,14 +47,16 @@ vec3 fresnel_schlick(vec3 fresnel_0, vec3 fresnel_90, float cos_theta) {
 
 
 /*! Evaluates the full BRDF with both diffuse and specular terms (unless they
-	are disabled by the given booleans). The diffuse BRDF is Disney diffuse.
-	The specular BRDF is Frostbite specular, i.e. a microfacet BRDF with GGX
-	normal distribution function, Smith masking-shadowing function and Fresnel-
-	Schlick approximation. The material model as a whole, agrees with the model
-	proposed for Frostbite:
+	are disabled by defines). The diffuse BRDF is Disney diffuse or Lambertian
+	diffuse. The specular BRDF (if any) is Frostbite specular, i.e. a
+	microfacet BRDF with GGX normal distribution function, Smith masking-
+	shadowing function and Fresnel-Schlick approximation. When
+	BRDF_FROSTBITE_DIFFUSE_SPECULAR is defined, the material model as a whole,
+	agrees with the model proposed for Frostbite:
 	https://seblagarde.files.wordpress.com/2015/07/course_notes_moving_frostbite_to_pbr_v32.pdf
-	https://dl.acm.org/doi/abs/10.1145/2614028.2615431 */
-vec3 evaluate_brdf(shading_data_t data, vec3 incoming_light_direction, bool diffuse, bool specular) {
+	https://dl.acm.org/doi/abs/10.1145/2614028.2615431
+*/
+vec3 evaluate_brdf(shading_data_t data, vec3 incoming_light_direction) {
 	// A few computations are shared between diffuse and specular evaluation
 	vec3 half_vector = normalize(incoming_light_direction + data.outgoing);
 	float lambert_incoming = dot(data.normal, incoming_light_direction);
@@ -62,35 +64,31 @@ vec3 evaluate_brdf(shading_data_t data, vec3 incoming_light_direction, bool diff
 	vec3 brdf = vec3(0.0f);
 
 	// Disney diffuse BRDF
-	if (diffuse) {
-		float fresnel_90 = fma(outgoing_dot_half * outgoing_dot_half, 2.0f * data.roughness, 0.5f);
-		float fresnel_product =
-			fresnel_schlick(vec3(1.0f), vec3(fresnel_90), data.lambert_outgoing).x
-			* fresnel_schlick(vec3(1.0f), vec3(fresnel_90), lambert_incoming).x;
-		brdf += fresnel_product * data.diffuse_albedo;
-	}
+#if BRDF_LAMBERTIAN_DIFFUSE
+	brdf += data.diffuse_albedo;
+#elif BRDF_DISNEY_DIFFUSE || BRDF_FROSTBITE_DIFFUSE_SPECULAR
+	float fresnel_90 = fma(outgoing_dot_half * outgoing_dot_half, 2.0f * data.roughness, 0.5f);
+	float fresnel_product =
+		fresnel_schlick(vec3(1.0f), vec3(fresnel_90), data.lambert_outgoing).x
+		* fresnel_schlick(vec3(1.0f), vec3(fresnel_90), lambert_incoming).x;
+	brdf += fresnel_product * data.diffuse_albedo;
+#endif
+#if BRDF_FROSTBITE_DIFFUSE_SPECULAR
 	// Frostbite specular BRDF
-	if (specular) {
-		float normal_dot_half = dot(data.normal, half_vector);
-		// Evaluate the GGX normal distribution function
-		float roughness_squared = data.roughness * data.roughness;
-		float ggx = fma(fma(normal_dot_half, roughness_squared, -normal_dot_half), normal_dot_half, 1.0f);
-		ggx = roughness_squared / (ggx * ggx);
-		// Evaluate the Smith masking-shadowing function
-		float masking = lambert_incoming * sqrt(fma(fma(-data.lambert_outgoing, roughness_squared, data.lambert_outgoing), data.lambert_outgoing, roughness_squared));
-		float shadowing = data.lambert_outgoing * sqrt(fma(fma(-lambert_incoming, roughness_squared, lambert_incoming), lambert_incoming, roughness_squared));
-		float smith = 0.5f / (masking + shadowing);
-		// Evaluate the Fresnel term and put it all together
-		vec3 fresnel = fresnel_schlick(data.fresnel_0, vec3(1.0f), clamp(outgoing_dot_half, 0.0f, 1.0f));
-		brdf += ggx * smith * fresnel;
-	}
+	float normal_dot_half = dot(data.normal, half_vector);
+	// Evaluate the GGX normal distribution function
+	float roughness_squared = data.roughness * data.roughness;
+	float ggx = fma(fma(normal_dot_half, roughness_squared, -normal_dot_half), normal_dot_half, 1.0f);
+	ggx = roughness_squared / (ggx * ggx);
+	// Evaluate the Smith masking-shadowing function
+	float masking = lambert_incoming * sqrt(fma(fma(-data.lambert_outgoing, roughness_squared, data.lambert_outgoing), data.lambert_outgoing, roughness_squared));
+	float shadowing = data.lambert_outgoing * sqrt(fma(fma(-lambert_incoming, roughness_squared, lambert_incoming), lambert_incoming, roughness_squared));
+	float smith = 0.5f / (masking + shadowing);
+	// Evaluate the Fresnel term and put it all together
+	vec3 fresnel = fresnel_schlick(data.fresnel_0, vec3(1.0f), clamp(outgoing_dot_half, 0.0f, 1.0f));
+	brdf += ggx * smith * fresnel;
+#endif
 	return brdf * M_INV_PI;
-}
-
-
-//! Overload that evaluates both diffuse and specular
-vec3 evaluate_brdf(shading_data_t data, vec3 incoming_light_direction) {
-	return evaluate_brdf(data, incoming_light_direction, true, true);
 }
 
 
