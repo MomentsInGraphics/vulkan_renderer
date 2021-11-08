@@ -166,7 +166,7 @@ int create_render_targets(render_targets_t* targets, const device_t* device, con
 			.image_info = {
 				.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
 				.imageType = VK_IMAGE_TYPE_2D,
-				.format = VK_FORMAT_D24_UNORM_S8_UINT,
+				.format = VK_FORMAT_D32_SFLOAT,
 				.extent = {swapchain->extent.width, swapchain->extent.height, 1},
 				.mipLevels = 1, .arrayLayers = 1, .samples = 1,
 				.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
