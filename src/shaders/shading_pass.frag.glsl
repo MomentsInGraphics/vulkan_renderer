@@ -17,6 +17,7 @@
 #version 460
 #extension GL_GOOGLE_include_directive : enable
 #extension GL_EXT_samplerless_texture_functions : enable
+#extension GL_EXT_nonuniform_qualifier : enable
 #extension GL_EXT_control_flow_attributes : enable
 #if TRACE_SHADOW_RAYS
 #extension GL_EXT_ray_query : enable
@@ -586,10 +587,10 @@ shading_data_t get_shading_data(ivec2 pixel, int primitive_index, vec3 ray_direc
 			tex_coord_derivs[i] += barycentrics_derivs[i][j] * tex_coords[j];
 	// Read all three textures
 	uint material_index = texelFetch(g_material_indices, primitive_index).r;
-	vec3 base_color = textureGrad(g_material_textures[3 * material_index + 0], tex_coord, tex_coord_derivs[0], tex_coord_derivs[1]).rgb;
-	vec3 specular_data = textureGrad(g_material_textures[3 * material_index + 1], tex_coord, tex_coord_derivs[0], tex_coord_derivs[1]).rgb;
+	vec3 base_color = textureGrad(g_material_textures[nonuniformEXT(3 * material_index + 0)], tex_coord, tex_coord_derivs[0], tex_coord_derivs[1]).rgb;
+	vec3 specular_data = textureGrad(g_material_textures[nonuniformEXT(3 * material_index + 1)], tex_coord, tex_coord_derivs[0], tex_coord_derivs[1]).rgb;
 	vec3 normal_tangent_space;
-	normal_tangent_space.xy = textureGrad(g_material_textures[3 * material_index + 2], tex_coord, tex_coord_derivs[0], tex_coord_derivs[1]).rg;
+	normal_tangent_space.xy = textureGrad(g_material_textures[nonuniformEXT(3 * material_index + 2)], tex_coord, tex_coord_derivs[0], tex_coord_derivs[1]).rg;
 	normal_tangent_space.xy = fma(normal_tangent_space.xy, vec2(2.0f), vec2(-1.0f));
 	normal_tangent_space.z = sqrt(max(0.0f, fma(-normal_tangent_space.x, normal_tangent_space.x, fma(-normal_tangent_space.y, normal_tangent_space.y, 1.0f))));
 	// Prepare BRDF parameters (i.e. immitate Falcor to be compatible with its
