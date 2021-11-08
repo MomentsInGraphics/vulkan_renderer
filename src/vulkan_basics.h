@@ -394,6 +394,14 @@ int create_buffers(buffers_t* buffers, const device_t* device, const VkBufferCre
 void destroy_buffers(buffers_t* buffers, const device_t* device);
 
 
+/*! Computes the size parameter for VkMappedMemoryRange when the goal is to
+	specify the whole range of the buffer with index buffer_index in buffers.*/
+static inline VkDeviceSize get_mapped_memory_range_size(const device_t* device, buffers_t* buffers, uint32_t buffer_index) {
+	VkDeviceSize size = align_memory_offset(buffers->buffers[buffer_index].size, device->physical_device_properties.limits.nonCoherentAtomSize);
+	return (buffers->buffers[buffer_index].offset + size > buffers->size) ? VK_WHOLE_SIZE : size;
+}
+
+
 /*! Implements copy_buffers(), copy_images() and copy_buffers_to_images() using
 	a single command buffer.*/
 int copy_buffers_and_images(const device_t* device,

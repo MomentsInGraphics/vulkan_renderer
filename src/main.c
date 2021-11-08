@@ -1359,13 +1359,13 @@ int render_gui(VkCommandBuffer cmd, application_t* app, uint32_t swapchain_index
 			.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
 			.memory = pass->geometry_allocation.memory,
 			.offset = pass->geometries[swapchain_index].buffers[0].offset,
-			.size = align_memory_offset(pass->geometries[swapchain_index].buffers[0].size, app->device.physical_device_properties.limits.nonCoherentAtomSize),
+			.size = get_mapped_memory_range_size(&app->device, &pass->geometry_allocation, 0),
 		},
 		{
 			.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
 			.memory = pass->geometry_allocation.memory,
 			.offset = pass->geometries[swapchain_index].buffers[1].offset,
-			.size = align_memory_offset(pass->geometries[swapchain_index].buffers[1].size, app->device.physical_device_properties.limits.nonCoherentAtomSize),
+			.size = get_mapped_memory_range_size(&app->device, &pass->geometry_allocation, 1),
 		},
 	};
 	vkFlushMappedMemoryRanges(app->device.device, COUNT_OF(gui_ranges), gui_ranges);
@@ -2228,7 +2228,7 @@ int render_frame(application_t* app) {
 	VkMappedMemoryRange constant_range = {
 		.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
 		.memory = app->constant_buffers.buffers.memory,
-		.size = app->constant_buffers.buffers.size / app->swapchain.image_count,
+		.size = get_mapped_memory_range_size(&app->device, &app->constant_buffers.buffers, swapchain_index),
 		.offset = app->constant_buffers.buffers.buffers[swapchain_index].offset
 	};
 	vkFlushMappedMemoryRanges(app->device.device, 1, &constant_range);
