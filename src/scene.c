@@ -164,7 +164,7 @@ int create_acceleration_structure(acceleration_structure_t* structure, const dev
 	};
 	buffers_t staging;
 	uint8_t* staging_data;
-	if (create_buffers(&staging, device, staging_infos, 2, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+	if (create_aligned_buffers(&staging, device, staging_infos, 2, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, 16)
 		|| vkMapMemory(device->device, staging.memory, 0, staging.size, 0, (void**) &staging_data))
 	{
 		printf("Failed to allocate and map a buffer for dequantized mesh data (%llu triangles) to create an acceleration structure.\n", mesh->triangle_count);
@@ -302,7 +302,7 @@ int create_acceleration_structure(acceleration_structure_t* structure, const dev
 		},
 	};
 	buffers_t scratch;
-	if (create_buffers(&scratch, device, scratch_infos, 2, VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) {
+	if (create_aligned_buffers(&scratch, device, scratch_infos, 2, VK_MEMORY_HEAP_DEVICE_LOCAL_BIT, device->acceleration_structure_properties.minAccelerationStructureScratchOffsetAlignment)) {
 		printf("Failed to allocate scratch memory for building acceleration structures.\n");
 		destroy_buffers(&staging, device);
 		destroy_acceleration_structure(structure, device);

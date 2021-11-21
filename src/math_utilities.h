@@ -82,3 +82,20 @@ static inline float half_to_float(uint16_t half) {
 	o.u |= (half & 0x8000) << 16;
 	return o.f;
 }
+
+
+//! Returns the greatest common divisor of the given two integers
+static inline uint64_t greatest_common_divisor(uint64_t a, uint64_t b) {
+	// This is the Euclidean algorithm
+	while (b != 0) {
+		uint64_t t = b;
+		b = a % b;
+		a = t;
+	}
+	return a;
+}
+
+//! Returns the least common multiple of the given two positive integers
+static inline uint64_t least_common_multiple(uint64_t a, uint64_t b) {
+	return a * (b / greatest_common_divisor(a, b));
+}
