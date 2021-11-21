@@ -43,8 +43,7 @@ https://www.nvidia.com/download/index.aspx
 
 To use ray tracing, you will also need a GPU that supports it. That includes
 all GPUs with RTX in the name. Pascal or Turing GPUs do not support the
-required extensions. AMD GPUs of the Radeon RX 6000 series should also work but
-have not been tested.
+required extensions. AMD GPUs of the Radeon RX 6000 series should also work.
 
 You can run the application without ray tracing but your driver has to support
 Vulkan 1.2. If the demo does not start, take a look at its command line output.
