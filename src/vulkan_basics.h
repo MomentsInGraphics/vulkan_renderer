@@ -51,6 +51,9 @@ typedef struct device_s {
 	VkPhysicalDeviceProperties physical_device_properties;
 	//! Information about memory available from the used physical device
 	VkPhysicalDeviceMemoryProperties memory_properties;
+	//! Information about the support for ray tracing acceleration structures
+	//! (if ray_tracing_supported)
+	VkPhysicalDeviceAccelerationStructurePropertiesKHR acceleration_structure_properties;
 
 	//! This object makes Vulkan functions available
 	VkInstance instance;
@@ -377,6 +380,10 @@ int create_images(images_t* images, const device_t* device,
 void destroy_images(images_t* images, const device_t* device);
 
 
+//! Like create_buffers() but additionally allows specification of an alignment
+//! in bytes for the offset of each buffer within the memory allocation
+int create_aligned_buffers(buffers_t* buffers, const device_t* device, const VkBufferCreateInfo* buffer_infos, uint32_t buffer_count, VkMemoryPropertyFlags memory_properties, VkDeviceSize alignment);
+
 /*! Creates one or more buffers according to the given specifications, performs
 	a single memory allocation for all of them and binds it.
 	\param buffers The output object. Use destroy_buffers() to free it.
@@ -387,7 +394,10 @@ void destroy_images(images_t* images, const device_t* device);
 	\param memory_properties The memory flags that you want to enforce for the
 		memory allocation. Combination of VkMemoryHeapFlagBits.
 	\return 0 on success.*/
-int create_buffers(buffers_t* buffers, const device_t* device, const VkBufferCreateInfo* buffer_infos, uint32_t buffer_count, VkMemoryPropertyFlags memory_properties);
+static inline int create_buffers(buffers_t* buffers, const device_t* device, const VkBufferCreateInfo* buffer_infos, uint32_t buffer_count, VkMemoryPropertyFlags memory_properties) {
+	return create_aligned_buffers(buffers, device, buffer_infos, buffer_count, memory_properties, 1);
+}
+
 
 /*! Destroys all buffers in the given object, frees the device memory
 	allocation, destroys arrays, zeros handles and zeros the object.*/
@@ -398,7 +408,7 @@ void destroy_buffers(buffers_t* buffers, const device_t* device);
 	specify the whole range of the buffer with index buffer_index in buffers.*/
 static inline VkDeviceSize get_mapped_memory_range_size(const device_t* device, buffers_t* buffers, uint32_t buffer_index) {
 	VkDeviceSize size = align_memory_offset(buffers->buffers[buffer_index].size, device->physical_device_properties.limits.nonCoherentAtomSize);
-	return (buffers->buffers[buffer_index].offset + size > buffers->size) ? VK_WHOLE_SIZE : size;
+	return (buffers->buffers[buffer_index].offset + size >= buffers->size) ? VK_WHOLE_SIZE : size;
 }
 
 

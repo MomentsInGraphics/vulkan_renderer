@@ -16,6 +16,7 @@
 
 #include "vulkan_basics.h"
 #include "string_utilities.h"
+#include "math_utilities.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -196,6 +197,15 @@ int create_vulkan_device(device_t* device, const char* application_internal_name
 		}
 		destroy_vulkan_device(device);
 		return 1;
+	}
+	// Query acceleration structure properties
+	if (device->ray_tracing_supported) {
+		device->acceleration_structure_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR;
+		VkPhysicalDeviceProperties2KHR device_properties = {
+			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2_KHR,
+			.pNext = &device->acceleration_structure_properties,
+		};
+		vkGetPhysicalDeviceProperties2(device->physical_device, &device_properties);
 	}
 	// Create a command pool for each queue
 	VkCommandPoolCreateInfo command_pool_info = {
@@ -678,7 +688,7 @@ void destroy_images(images_t* images, const device_t* device) {
 }
 
 
-int create_buffers(buffers_t* buffers, const device_t* device, const VkBufferCreateInfo* buffer_infos, uint32_t buffer_count, VkMemoryPropertyFlags memory_properties) {
+int create_aligned_buffers(buffers_t* buffers, const device_t* device, const VkBufferCreateInfo* buffer_infos, uint32_t buffer_count, VkMemoryPropertyFlags memory_properties, VkDeviceSize alignment) {
 	memset(buffers, 0, sizeof(*buffers));
 	buffers->buffer_count = buffer_count;
 	if (buffer_count == 0)
@@ -706,7 +716,8 @@ int create_buffers(buffers_t* buffers, const device_t* device, const VkBufferCre
 		vkGetBufferMemoryRequirements(device->device, buffers->buffers[i].buffer, &memory_requirements);
 		memory_type_bits &= memory_requirements.memoryTypeBits;
 		buffers->buffers[i].size = buffer_infos[i].size;
-		buffers->buffers[i].offset = align_memory_offset(current_size, memory_requirements.alignment);
+		VkDeviceSize combined_alignment = least_common_multiple(alignment, memory_requirements.alignment);
+		buffers->buffers[i].offset = align_memory_offset(current_size, combined_alignment);
 		current_size = buffers->buffers[i].offset + memory_requirements.size;
 	}
 	VkMemoryAllocateFlagsInfo allocation_flags = {

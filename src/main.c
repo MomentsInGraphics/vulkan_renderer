@@ -241,7 +241,7 @@ int create_constant_buffers(constant_buffers_t* constant_buffers, const device_t
 	VkBufferCreateInfo* constant_buffer_infos = malloc(sizeof(VkBufferCreateInfo) * swapchain->image_count);
 	for (uint32_t i = 0; i != swapchain->image_count; ++i)
 		constant_buffer_infos[i] = constant_buffer_info;
-	if (create_buffers(&constant_buffers->buffers, device, constant_buffer_infos, swapchain->image_count, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
+	if (create_aligned_buffers(&constant_buffers->buffers, device, constant_buffer_infos, swapchain->image_count, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, device->physical_device_properties.limits.nonCoherentAtomSize)) {
 		printf("Failed to create constant buffers.\n");
 		free(constant_buffer_infos);
 		destroy_constant_buffers(constant_buffers, device);
@@ -745,7 +745,7 @@ int create_interface_pass(interface_pass_t* pass, const device_t* device, imgui_
 	VkBufferCreateInfo* duplicate_geometry_infos = malloc(sizeof(VkBufferCreateInfo) * geometry_count);
 	for (uint32_t i = 0; i != geometry_count; ++i)
 		duplicate_geometry_infos[i] = geometry_infos[i % COUNT_OF(geometry_infos)];
-	if (create_buffers(&pass->geometry_allocation, device, duplicate_geometry_infos, geometry_count, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+	if (create_aligned_buffers(&pass->geometry_allocation, device, duplicate_geometry_infos, geometry_count, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, device->physical_device_properties.limits.nonCoherentAtomSize)) {
 		printf("Failed to create geometry buffers for the interface pass.\n");
 		destroy_interface_pass(pass, device);
 		free(duplicate_geometry_infos);
@@ -1155,13 +1155,13 @@ int render_gui(VkCommandBuffer cmd, application_t* app, uint32_t swapchain_index
 			.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
 			.memory = pass->geometry_allocation.memory,
 			.offset = pass->geometries[swapchain_index].buffers[0].offset,
-			.size = get_mapped_memory_range_size(&app->device, &pass->geometry_allocation, 0),
+			.size = get_mapped_memory_range_size(&app->device, &pass->geometry_allocation, 2 * swapchain_index + 0),
 		},
 		{
 			.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
 			.memory = pass->geometry_allocation.memory,
 			.offset = pass->geometries[swapchain_index].buffers[1].offset,
-			.size = get_mapped_memory_range_size(&app->device, &pass->geometry_allocation, 1),
+			.size = get_mapped_memory_range_size(&app->device, &pass->geometry_allocation, 2 * swapchain_index + 1),
 		},
 	};
 	vkFlushMappedMemoryRanges(app->device.device, COUNT_OF(gui_ranges), gui_ranges);
