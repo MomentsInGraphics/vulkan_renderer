@@ -405,7 +405,7 @@ int create_or_resize_swapchain(swapchain_t* swapchain, const device_t* device, V
 	uint32_t requested_image_count = 2;
 	if (requested_image_count < surface_capabilities.minImageCount)
 		requested_image_count = surface_capabilities.minImageCount;
-	if (requested_image_count > surface_capabilities.maxImageCount)
+	if (requested_image_count > surface_capabilities.maxImageCount && surface_capabilities.maxImageCount != 0)
 		requested_image_count = surface_capabilities.maxImageCount;
 	VkSwapchainCreateInfoKHR swapchain_info = {
 		.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
