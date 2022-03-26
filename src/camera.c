@@ -1,4 +1,4 @@
-//  Copyright (C) 2021, Christoph Peters, Karlsruhe Institute of Technology
+//  Copyright (C) 2022, Christoph Peters, Karlsruhe Institute of Technology
 //
 //  This program is free software: you can redistribute it and/or modify
 //  it under the terms of the GNU General Public License as published by
@@ -83,7 +83,7 @@ void get_world_to_projection_space(float world_to_projection_space[4][4], const 
 }
 
 
-void control_camera(first_person_camera_t* camera, GLFWwindow* window) {
+float control_camera(first_person_camera_t* camera, GLFWwindow* window) {
 	// Implement camera rotation
 	static const float mouse_radians_per_pixel = 1.0f * M_PI_F / 1000.0f;
 	int right_mouse_state = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_2);
@@ -128,4 +128,5 @@ void control_camera(first_person_camera_t* camera, GLFWwindow* window) {
 	camera->position_world_space[0] -= cos_z * right;
 	camera->position_world_space[1] += sin_z * right;
 	camera->position_world_space[2] += vertical;
+	return time_delta;
 }

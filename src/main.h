@@ -1,4 +1,4 @@
-//  Copyright (C) 2021, Christoph Peters, Karlsruhe Institute of Technology
+//  Copyright (C) 2022, Christoph Peters, Karlsruhe Institute of Technology
 //
 //  This program is free software: you can redistribute it and/or modify
 //  it under the terms of the GNU General Public License as published by
@@ -16,103 +16,19 @@
 
 #pragma once
 #include "vulkan_basics.h"
-#include "noise_table.h"
 #include "camera.h"
-#include "polygonal_light.h"
-#include "ltc_table.h"
 #include "scene.h"
 #include "imgui_vulkan.h"
 
-
-/*! Holds all information that characterizes the scene (geometry, materials,
-	lighting and camera). It does not hold the loaded objects.*/
-typedef struct scene_specification_s {
-	//! Path to the *.vks file holding scene geometry
-	char* file_path;
-	//! Path to the directory holding scene textures
-	char* texture_path;
-	//! Path to the file from which light sources and camera have been loaded
-	char* quick_save_path;
-	//! The current camera
-	first_person_camera_t camera;
-	//! Number of polygonal lights illuminating the scene
-	uint32_t polygonal_light_count;
-	//! The polygonal lights illuminating the scene
-	polygonal_light_t* polygonal_lights;
-} scene_specification_t;
-
-//! Available methods to combine diffuse and specular samples
-typedef enum sampling_strategies_e {
-	//! Only the sampling strategy for diffuse samples is used but the full
-	//! BRDF is evaluated
-	sampling_strategies_diffuse_only,
-	//! Sampling strategies for diffuse and specular samples are used and
-	//! combined by multiple importance sampling. The specular samples are
-	//! produced in proportion to the GGX specular BRDF by sampling the visible
-	//! normal distribution function (VNDF) but regardless of the geometry of
-	//! the polygonal light, i.e. they may miss it.
-	sampling_strategies_diffuse_ggx_mis,
-	//! The diffuse sampling strategy is used with the diffuse BRDF only and
-	//! the specular sampling strategy is used with the specular BRDF only
-	sampling_strategies_diffuse_specular_separately,
-	//! Sampling strategies for diffuse and specular samples are used and
-	//! combined by multiple importance sampling
-	sampling_strategies_diffuse_specular_mis,
-	//! One of the sampling strategies for diffuse and specular is picked
-	//! randomly with weights proportional to the estimated unshadowed
-	//! contribution
-	sampling_strategies_diffuse_specular_random,
-	//! Number of available sampling strategies
-	sampling_strategies_count
-} sampling_strategies_t;
-
-//! Available variants of multiple importance sampling. See Veach's thesis:
-//! http://graphics.stanford.edu/papers/veach_thesis/
-typedef enum mis_heuristic_e {
-	//! The balance heuristic as described by Veach (p. 264)
-	mis_heuristic_balance,
-	//! The power heuristic with exponent 2 as described by Veach (p. 273)
-	mis_heuristic_power,
-	//! Our weighted variant of the balance heuristic that incorporates
-	//! estimates of the unshadowed reflected radiance
-	mis_heuristic_weighted,
-	//! Our optimal MIS strategy, clamped to only use non-negative weights
-	mis_heuristic_optimal_clamped,
-	//! Our optimal MIS strategy. It is a blend between balance heuristic and
-	//! weighted balance heuristic and under some fairly weak assumptions it is
-	//! provably optimal for some degree of visibility. It uses negative
-	//! weights and produces non-zero splats (with zero-mean) for occluded
-	//! rays. This way, it reduces variance a bit but introduces leaking.
-	mis_heuristic_optimal,
-	//! Number of available heuristics
-	mis_heuristic_count
-} mis_heuristic_t;
 
 //! Settings for how the error of projected solid angle sampling should be
 //! visualized
 typedef enum error_display_e {
 	//! The scene is rendered, no errors are displayed
 	error_display_none,
-	//! The error of the first sample using the diffuse sampling strategy is
-	//! displayed as error in the first random number
-	error_display_diffuse_backward,
-	//! The error of the first sample using the diffuse sampling strategy is
-	//! displayed as error in the first random number, multiplied by the
-	//! projected solid angle of the polygon
-	error_display_diffuse_backward_scaled,
-	//! The error of the first sample using the diffuse sampling strategy is
-	//! displayed as error in the sampled direction in radians
-	error_display_diffuse_forward,
-	//! The error of the first sample using the specular sampling strategy is
-	//! displayed as error in the first random number
-	error_display_specular_backward,
-	//! The error of the first sample using the specular sampling strategy is
-	//! displayed as error in the first random number, multiplied by the
-	//! projected solid angle of the polygon
-	error_display_specular_backward_scaled,
-	//! The error of the first sample using the specular sampling strategy is
-	//! displayed as error in the sampled direction in radians
-	error_display_specular_forward,
+	//! The error in world space positions after blending is visualized using
+	//! a logarithmic scale and a color map
+	error_display_positions_logarithmic,
 	//! Number of available settings
 	error_display_count
 } error_display_t;
@@ -126,57 +42,87 @@ typedef enum bool_override_e {
 
 //! Options that control how the scene will be rendered
 typedef struct render_settings_s {
-	//! Constant factors for the overall brightness and surface roughness
-	float exposure_factor, roughness_factor;
-	//! The number of samples used per sampling technique
-	uint32_t sample_count;
-	//! The way in which diffuse and specular samples are combined
-	sampling_strategies_t sampling_strategies;
-	//! The heuristic used for multiple importance sampling
-	mis_heuristic_t mis_heuristic;
-	//! An estimate of how much each shading point is shadowed. Used as a
-	//! parameter to control optimal multiple importance sampling.
-	float mis_visibility_estimate;
-	//! The technique used to sample polygonal lights
-	sample_polygon_technique_t polygon_sampling_technique;
+	//! Constant factor for the overall brightness
+	float exposure_factor;
+	//! All surfaces use this constant roughness value
+	float roughness;
 	//! Whether the error of the diffuse or specular sampling strategy should
 	//! be visualized
 	error_display_t error_display;
-	//! An error of pow(10.0f, error_min_exponent) is displayed as dark blue
-	float error_min_exponent;
-	//! The type of tabulated noise to use for Monte Carlo integration
-	noise_type_t noise_type;
-	//! Whether noise should be updated each frame
-	VkBool32 animate_noise;
-	//! Whether ray traced shadows should be used
-	VkBool32 trace_shadow_rays;
-	//! Whether light sources should be rendered
-	VkBool32 show_polygonal_lights;
+	//! An error of pow(10.0f, error_min_exponent) meters in world space
+	//! positions is displayed as dark blue. pow(10.0f, error_max_exponent)
+	//! maps to light yellow.
+	float error_min_exponent, error_max_exponent;
 	//! Whether the user interface should be rendered
 	VkBool32 show_gui;
 	//! Whether vertical synchronization should be used (caps frame rate)
 	VkBool32 v_sync;
+	//! The speed (in seconds per second) at which the animation should be
+	//! played back
+	float playback_speed;
+	//! The number of instances to display
+	uint32_t instance_count;
+	//! The number of bytes per vertex for blend attributes set in the user
+	//! interface. The actually used value is the one in compression_params.
+	uint32_t requested_vertex_size;
+	//! The maximal number of bone influences per vertex set in the user
+	//! interface. The actually used value is the one in compression_params.
+	uint32_t requested_max_bone_count;
+	//! The method and parameters used for blend attribute compression
+	blend_attribute_compression_parameters_t compression_params;
 } render_settings_t;
 
 
-//! An enumeration of indices for g_scene_paths, i.e. it lists available scenes
+//! An enumeration of indices for g_scene_sources, i.e. it lists all available
+//! scenes
 typedef enum scene_index_e {
-	scene_cornell_box,
-	scene_mis_plane,
-	scene_roughness_planes,
-	scene_shadowed_plane,
-	scene_arcade,
-	scene_living_room,
-	scene_attic,
-	scene_bistro_inside,
-	scene_bistro_outside,
+	scene_warrok,
+	scene_joe,
+	scene_chad,
+	scene_shannon,
+	scene_elvis,
+	scene_boss,
+	scene_characters,
 	scene_count
 } scene_index_t;
 
-/*! For each available scene, this array holds its display name, the path to
-	the *.vks file, the directory holding the textures and the path to the
-	quick save file.*/
-extern const char* const g_scene_paths[scene_count][4];
+//! Defines where a scene is loaded from and provides some meta-data
+typedef struct scene_source_s {
+	//! The display name in the user interface
+	char* name;
+	//! The path to the *.vks file
+	char* file_path;
+	//! The path to the directory holding the textures
+	char* texture_path;
+	//! The path to the quick save file for the scene
+	char* quick_save_path;
+	//! The maximal number of bone influences per vertex in this scene
+	uint32_t available_bone_count;
+	//! An upper bound for how large the table of tuble indices for this scene
+	//! needs to be
+	uint32_t max_tuple_count;
+} scene_source_t;
+
+//! All scenes that can be selected in the user interface
+extern const scene_source_t g_scene_sources[scene_count];
+
+
+/*! Holds all information that characterizes the scene (geometry, materials,
+	lighting and camera). It does not hold the loaded objects.*/
+typedef struct scene_specification_s {
+	//! The source of this scene (paths) and some meta data
+	scene_source_t source;
+	//! The current camera
+	first_person_camera_t camera;
+	//! The azimuth and inclination for the light direction vector
+	float light_inclination, light_azimuth;
+	//! The irradiance of the directional light on a surface orthogonal to the
+	//! light direction (linear RGB)
+	float light_irradiance[3];
+	//! The currently displayed time in the animation in seconds
+	//! \see animation_t.
+	float time;
+} scene_specification_t;
 
 
 //! Specifies a scene, a camera, lighting and render settings. Overall, a frame
@@ -185,7 +131,7 @@ typedef struct experiment_s {
 	//! The swapchain resolution that should be used for this experiment. May
 	//! be zero to indicate no preference.
 	uint32_t width, height;
-	//! Index into g_scene_paths to specify the scene
+	//! Index into g_scene_sources to specify the scene
 	scene_index_t scene_index;
 	//! The path to the quick save specifying camera and lighting. If it is,
 	//! NULL the default quicksave for the scene is used.
@@ -255,13 +201,11 @@ typedef struct render_targets_s {
 	//! duplicate_count.
 	union {
 		struct {
-			//! The depth buffer used in the geometry pass
+			//! The depth buffer used in the forward pass
 			image_t depth_buffer;
-			//! The visibility buffer, which stores a primitive index per pixel
-			image_t visibility_buffer;
 		};
 		//! Array of all render targets available from this object
-		image_t targets[2];
+		image_t targets[1];
 	}* targets;
 } render_targets_t;
 
@@ -275,28 +219,17 @@ typedef struct constant_buffers_s {
 } constant_buffers_t;
 
 
-//! The sub pass that produces the visibility buffer by rasterizing all
-//! geometry once
-typedef struct geometry_pass_s {
-	//! Pipeline state and bindings for the geometry pass
+//! The sub pass that renders shaded geometry to the swap chain
+typedef struct forward_pass_s {
+	//! Pipeline state and bindings for the forward pass
 	pipeline_with_bindings_t pipeline;
+	//! The vertex buffers that need to be bound for the above pipeline
+	VkBuffer vertex_buffers[5];
+	//! The number of vertex buffers that need to be bound
+	uint32_t vertex_buffer_count;
 	//! The used vertex and fragment shader
 	shader_t vertex_shader, fragment_shader;
-} geometry_pass_t;
-
-
-//! The sub pass that renders a screen filling triangle to perform deferred
-//! shading in a fragment shader, possibly with ray queries for shadows
-typedef struct shading_pass_s {
-	//! 1 if the shading pass uses ray queries for shadows
-	VkBool32 use_ray_tracing;
-	//! Pipeline state and bindings for the shading pass
-	pipeline_with_bindings_t pipeline;
-	//! The vertex and fragment shader that implements the shading pass
-	shader_t vertex_shader, fragment_shader;
-	//! The sampler for light textures
-	VkSampler light_texture_sampler;
-} shading_pass_t;
+} forward_pass_t;
 
 
 //! The sub pass that renders the user interface on top of the shaded frame
@@ -340,8 +273,8 @@ typedef struct interface_pass_s {
 typedef struct render_pass_s {
 	//! Number of held framebuffers (= swapchain images)
 	uint32_t framebuffer_count;
-	//! A framebuffer per swapchain image with the depth buffer (0), the
-	//! visibility buffer (1) and the swapchain image (2) attached
+	//! A framebuffer per swapchain image with the depth buffer (0) and the
+	//! swapchain image (1) attached
 	VkFramebuffer* framebuffers;
 	//! The render pass that encompasses all subpasses for rendering a frame
 	VkRenderPass render_pass;
@@ -437,18 +370,10 @@ typedef struct application_updates_s {
 	VkBool32 recreate_swapchain;
 	//! All shaders need to be recompiled
 	VkBool32 reload_shaders;
-	//! The number of light sources in the scene or the number of vertices in a
-	//! polygonal light source has changed
-	VkBool32 update_light_count;
-	//! A texture of a polygonal light source has changed
-	VkBool32 update_light_textures;
 	//! The scene itself has changed
 	VkBool32 reload_scene;
 	//! Settings that define how shading is performed have changed
 	VkBool32 change_shading;
-	//! The noise table needs to be recreated (usually transition between white
-	//! and blue noise)
-	VkBool32 regenerate_noise;
 	//! The current camera and lights should be stored to / loaded from a file
 	VkBool32 quick_save, quick_load;
 } application_updates_t;
@@ -465,13 +390,10 @@ typedef struct application_s {
 	render_settings_t render_settings;
 	//! The currently loaded scene
 	scene_t scene;
-	noise_table_t noise_table;
-	ltc_table_t ltc_table;
 	render_targets_t render_targets;
 	constant_buffers_t constant_buffers;
 	images_t light_textures;
-	geometry_pass_t geometry_pass;
-	shading_pass_t shading_pass;
+	forward_pass_t forward_pass;
 	interface_pass_t interface_pass;
 	render_pass_t render_pass;
 	frame_queue_t frame_queue;
@@ -487,22 +409,36 @@ typedef struct application_s {
 	\see shared_constants.glsl */
 typedef struct per_frame_constants_s {
 	float mesh_dequantization_factor[3], padding_0, mesh_dequantization_summand[3];
-	float error_factor;
+	float padding_1;
 	float world_to_projection_space[4][4];
 	float pixel_to_ray_direction_world_space[3][4];
 	float camera_position_world_space[3];
-	float mis_visibility_estimate;
+	float error_factor;
+	float light_direction_world_space[3];
+	float error_summand;
+	float light_irradiance[3];
+	float padding_3;
 	VkExtent2D viewport_size;
 	int32_t cursor_position[2];
 	float exposure_factor;
-	float roughness_factor;
-	uint32_t noise_resolution_mask[2];
-	uint32_t noise_texture_index_mask;
+	float roughness;
 	uint32_t frame_bits;
-	uint32_t padding_3[2];
-	uint32_t noise_random_numbers[4];
-	ltc_constants_t ltc_constants;
+	float time_tex_coord;
+	float inv_bone_count;
+	float animation_column_spacing;
+	float animation_half_column_spacing;
+	float padding_4;
+	float animation_dequantization[16];
 } per_frame_constants_t;
+
+
+//! Utility function to create a deep copy of a scene source with copies of all
+//! the strings
+void copy_scene_source(scene_source_t* dest, const scene_source_t* source);
+
+//! Frees memory for strings and zeros the given object. Never invoke this on
+//! elements of g_scene_sources.
+void destroy_scene_source(scene_source_t* scene);
 
 
 //! Creates a list of experiments. Each results in a screenshot with a timing.

@@ -1,4 +1,4 @@
-//  Copyright (C) 2021, Christoph Peters, Karlsruhe Institute of Technology
+//  Copyright (C) 2022, Christoph Peters, Karlsruhe Institute of Technology
 //
 //  This program is free software: you can redistribute it and/or modify
 //  it under the terms of the GNU General Public License as published by
@@ -98,4 +98,28 @@ static inline uint64_t greatest_common_divisor(uint64_t a, uint64_t b) {
 //! Returns the least common multiple of the given two positive integers
 static inline uint64_t least_common_multiple(uint64_t a, uint64_t b) {
 	return a * (b / greatest_common_divisor(a, b));
+}
+
+
+/*! Decomposes a natural number into a sum of given summands. It proceeds
+	greedily, i.e. first it uses summands[0] as often as possible, then
+	summands[1] and so forth.
+	\param summands Pointer to an output array with enough space. Upon success,
+		summing over the written entries gives sum.
+	\param sum The desired sum.
+	\param value_count Number of available values to sum.
+	\param values Numbers that are available to use in the sum. For most use
+		cases, this should be sorted in decreasing order.
+	\return 0 if the method failed. The number of used summands upon success.
+		Success is guaranteed if summands contains 1.*/
+static inline uint32_t write_as_sum(uint32_t* summands, uint32_t sum, uint32_t value_count, const uint32_t* values) {
+	uint32_t remainder = sum;
+	uint32_t summand_count = 0;
+	for (uint32_t i = 0; i != value_count; ++i) {
+		while (remainder >= values[i] && values[i] != 0) {
+			remainder -= values[i];
+			summands[summand_count++] = values[i];
+		}
+	}
+	return (remainder == 0) ? summand_count : 0;
 }

@@ -1,5 +1,8 @@
 ﻿cmake_policy(SET CMP0076 NEW)
 target_sources(vulkan_renderer PRIVATE
+	blend_attribute_compression.c
+	blend_attribute_compression.h
+	blend_attribute_compression_related_work.h
 	camera.c
 	camera.h
 	experiment_list.c
@@ -7,15 +10,12 @@ target_sources(vulkan_renderer PRIVATE
 	frame_timer.h
 	imgui_vulkan.cpp
 	imgui_vulkan.h
-	ltc_table.c
-	ltc_table.h
 	main.c
 	main.h
 	math_utilities.h
-	noise_table.h
-	noise_table.c
-	polygonal_light.c
-	polygonal_light.h
+	optimal_simplex_sampling.c
+	optimal_simplex_sampling.h
+	permutation_coding.h
 	scene.c
 	scene.h
 	stb_image_write.h
@@ -26,23 +26,19 @@ target_sources(vulkan_renderer PRIVATE
 	user_interface.h
 	vulkan_basics.c
 	vulkan_basics.h
+	shaders/blend_attribute_codec.glsl
+	shaders/blend_attribute_compression.glsl
 	shaders/brdfs.glsl
-	shaders/cubic_solver.glsl
+	shaders/forward_pass.frag.glsl
+	shaders/forward_pass.vert.glsl
 	shaders/imgui.frag.glsl
 	shaders/imgui.vert.glsl
-	shaders/ltc_utility.glsl
 	shaders/math_constants.glsl
 	shaders/mesh_quantization.glsl
-	shaders/noise_utility.glsl
-	shaders/polygon_sampling.glsl
-	shaders/polygon_sampling_related_work.glsl
-	shaders/polygon_clipping.glsl
-	shaders/polygonal_light_utility.glsl
-	shaders/shading_pass.frag.glsl
-	shaders/shading_pass.vert.glsl
+	shaders/optimal_simplex_sampling_19.glsl
+	shaders/optimal_simplex_sampling_22.glsl
+	shaders/optimal_simplex_sampling_35.glsl
 	shaders/shared_constants.glsl
 	shaders/srgb_utility.glsl
-	shaders/unrolling.glsl
-	shaders/visibility_pass.frag.glsl
-	shaders/visibility_pass.vert.glsl
+	shaders/viridis.glsl
 )

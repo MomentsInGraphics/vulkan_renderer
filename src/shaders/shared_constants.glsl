@@ -1,4 +1,4 @@
-//  Copyright (C) 2021, Christoph Peters, Karlsruhe Institute of Technology
+//  Copyright (C) 2022, Christoph Peters, Karlsruhe Institute of Technology
 //
 //  This program is free software: you can redistribute it and/or modify
 //  it under the terms of the GNU General Public License as published by
@@ -14,14 +14,9 @@
 //  along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 
-#include "polygonal_light_utility.glsl"
-#include "ltc_utility.glsl"
-
 layout (std140, row_major, binding = 0) uniform per_frame_constants {
 	//! Bounding-box dependent constants needed for dequantization of positions
 	vec3 g_mesh_dequantization_factor, g_mesh_dequantization_summand;
-	//! The reciprocal of the minimal error that maps to a distinct color
-	float g_error_factor;
 	//! The transform from world space to projection space
 	mat4 g_world_to_projection_space;
 	//! Turns a column vector (pixel.x, pixel.y, 1.0f) with integer screen
@@ -30,10 +25,16 @@ layout (std140, row_major, binding = 0) uniform per_frame_constants {
 	mat3 g_pixel_to_ray_direction_world_space;
 	//! The location of the camera in world space
 	vec3 g_camera_position_world_space;
-	//! An estimate of how much darker each shading point is due to shadows.
-	//! Of course, a uniform can impossibly get this right. This parameter
-	//! mostly controls for which scenarios optimal MIS works well.
-	float g_mis_visibility_estimate;
+	//! To map log2(error) to an error value from 0 to 1 for display, multiply
+	//! by g_error_factor and add g_error_summand, then clamp
+	float g_error_factor;
+	//! The normalized world space direction vector for the directional light
+	vec3 g_light_direction_world_space;
+	//! \see g_error_factor
+	float g_error_summand;
+	//! The irradiance of the directional light on a surface orthogonal to the
+	//! light direction (linear RGB)
+	vec3 g_light_irradiance;
 	//! The viewport size in pixels
 	uvec2 g_viewport_size;
 	//! The location of the mouse cursor in pixels, relative to the left top of
@@ -42,25 +43,22 @@ layout (std140, row_major, binding = 0) uniform per_frame_constants {
 	//! An exposure factor. It is multiplied onto the linear outgoing radiance
 	//! once all shading work is completed
 	float g_exposure_factor;
-	//! This constant provides the means to experiment with surfaces of
-	//! different roughness quickly. All roughness values are multiplied by it
-	//! and then clampled to the range from zero to one.
-	float g_roughness_factor;
-	//! Resolution of textures in g_noise_table, which must be a power of two,
-	//! minus one
-	uvec2 g_noise_resolution_mask;
-	//! Number of textures in g_noise_table, which must be a power of two,
-	//! minus one
-	uint g_noise_texture_index_mask;
+	//! All materials use this constant roughness value
+	float g_roughness;
 	//! 0 if an LDR frame should be output, 1 if low bits of a 16-bit HDR frame
 	//! should be output, 2 if high bits of a 16-bit HDR frame should be output
 	uint g_frame_bits;
-	//! Constants to randomize access to noise textures
-	uvec4 g_noise_random_numbers;
-	//! Constants for accessing linearly transformed cosine tables
-	ltc_constants_t g_ltc_constants;
-#ifdef POLYGONAL_LIGHT_ARRAY_SIZE
-	//! The polygonal lights that are illuminating the scene
-	polygonal_light_t g_polygonal_lights[POLYGONAL_LIGHT_ARRAY_SIZE];
-#endif
+	//! The texture coordinate that corresponds to the currently displayed time
+	//! in the animation texture
+	float g_time_tex_coord;
+	//! The reciprocal of the number of bones in the animation texture
+	float g_inv_bone_count;
+	//! The reciprocal of the width of the animation texture (i.e. the distance
+	//! in texture coordinates between data for two rows of a transform)
+	float g_animation_column_spacing;
+	//! 0.5f * g_animation_column_spacing
+	float g_animation_half_column_spacing;
+	//! Factors and summands used for dequantization of 16-bit uints in the
+	//! animation texture
+	vec4 g_animation_dequantization[4];
 };

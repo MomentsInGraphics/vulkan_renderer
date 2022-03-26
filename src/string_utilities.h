@@ -1,4 +1,4 @@
-//  Copyright (C) 2021, Christoph Peters, Karlsruhe Institute of Technology
+//  Copyright (C) 2022, Christoph Peters, Karlsruhe Institute of Technology
 //
 //  This program is free software: you can redistribute it and/or modify
 //  it under the terms of the GNU General Public License as published by
@@ -70,6 +70,14 @@ static inline char* format_uint2(const char* format_string, uint32_t integer_0, 
 	int size = snprintf(NULL, 0, format_string, integer_0, integer_1) + 1;
 	char* result = (char*) malloc(size);
 	sprintf(result, format_string, integer_0, integer_1);
+	return result;
+}
+
+//! Like format_uint() but with three %u in format_string
+static inline char* format_uint3(const char* format_string, uint32_t integer_0, uint32_t integer_1, uint32_t integer_2) {
+	int size = snprintf(NULL, 0, format_string, integer_0, integer_1, integer_2) + 1;
+	char* result = (char*) malloc(size);
+	sprintf(result, format_string, integer_0, integer_1, integer_2);
 	return result;
 }
 

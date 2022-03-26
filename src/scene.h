@@ -1,4 +1,4 @@
-//  Copyright (C) 2021, Christoph Peters, Karlsruhe Institute of Technology
+//  Copyright (C) 2022, Christoph Peters, Karlsruhe Institute of Technology
 //
 //  This program is free software: you can redistribute it and/or modify
 //  it under the terms of the GNU General Public License as published by
@@ -16,6 +16,7 @@
 
 #pragma once
 #include "vulkan_basics.h"
+#include "blend_attribute_compression.h"
 #include <stdio.h>
 #include <stdint.h>
 
@@ -23,20 +24,14 @@
 //! This enumeration characterizes the buffers that are needed to store a mesh.
 //! The numerical values represent the array indices of the respective buffers.
 typedef enum mesh_buffer_type_e {
-	//! \see mesh_t.positions
-	mesh_buffer_type_positions,
-	//! \see mesh_t.normals_and_tex_coords
-	mesh_buffer_type_normals_and_tex_coords,
+	//! \see mesh_t.vertices
+	mesh_buffer_type_vertices,
+	//! \see mesh_t.bone_index_table
+	mesh_buffer_type_bone_index_table,
 	//! \see mesh_t.material_indices
 	mesh_buffer_type_material_indices,
-	//! The number of buffers needed to represent a mesh, excluding the screen-
-	//! filling triangle
+	//! The number of buffers needed to represent a mesh
 	mesh_buffer_count,
-	//! \see mesh_t.triangle
-	mesh_buffer_type_triangle = mesh_buffer_count,
-	//! The number of buffers needed to represent a mesh, including the screen-
-	//! filling triangle
-	mesh_buffer_count_full
 } mesh_buffer_type_t;
 
 
@@ -51,44 +46,53 @@ typedef struct mesh_s {
 		unsigned integers into world-space coordinates, multiply by this factor
 		and add the summand component-wise.*/
 	float dequantization_factor[3], dequantization_summand[3];
+	//! The number of unique tuples of bone indices across all vertices. This
+	//! is used to compute the buffer size. For the staging buffer it is an
+	//! upper bound, for the device buffer it is exact.
+	uint64_t max_tuple_count;
+	//! The number of entries in the vectors provided by bone_index_table_view
+	uint32_t tuple_vector_size;
+	//! The compression scheme used for vertex blend attributes
+	blend_attribute_compression_parameters_t compression_params;
+	//! Whether ground truth bone indices and weights are part of the vertex
+	//! buffer, even if compressed data is available
+	VkBool32 store_ground_truth;
 	union {
 		struct {
-			/*! A buffer of 2*3*triangle_count uint32_t storing three vertex
-				positions for each triangle. The bits of these two uints from
-				least significant to most significant are:
-				xxxx xxxx xxxx xxxx xxxx xyyy yyyy yyyy
-				yyyy yyyy yyzz zzzz zzzz zzzz zzzz zzz-
+			/*! All data that is stored per vertex in an interleaved format.
+				There are three vertices per triangle. The first 128 bits per
+				vertex are:
+				- position: 64 bits with the following meaning (from least to
+				  most significant):
+				  xxxx xxxx xxxx xxxx xxxx xyyy yyyy yyyy
+				  yyyy yyyy yyzz zzzz zzzz zzzz zzzz zzz-
+				- normal: Two 16-bit UNORMs providing a coordinate in an
+				  octahedral map for the object space normal vector.
+				- texture coordinate: Two 16-bit UNORMs providing the texture
+				  coordinate, divided by 8.
+				The remaining bytes provide ground truth and/or compressed
+				weights and indices for blending. See compression_params.
 				\sa dequantization_factor, dequantization_summand */
-			buffer_t positions;
-			/*! 3*triangle_count normal vectors and texture coordinate pairs
-				for the vertices of this mesh. Normal vectors are stored in two
-				16-bit UNORMs using an octahedral map, followed by two 16-bit
-				UNORMs for the texture coordinate. Texture coordinates need to
-				be multiplied by 8 to support wrapping within a triangle.*/
-			buffer_t normals_and_tex_coords;
-			//! A 16-bit material index for each triangle
+			buffer_t vertices;
+			//! A table holding unique tuples of uint16_t bone indices
+			buffer_t bone_index_table;
+			//! An 8-bit material index for each triangle
 			buffer_t material_indices;
-			//! A vertex buffer providing a screen-filling triangle. It is not
-			//! related to the scene but we want to have it in the same memory
-			//! allocation for convenience.
-			buffer_t triangle;
 		};
 		//! All buffers that make up this mesh
-		buffer_t buffers[mesh_buffer_count_full];
+		buffer_t buffers[mesh_buffer_count];
 	};
 	union {
 		struct {
-			//! View onto positions. NULL for staging.
-			VkBufferView positions_view;
-			//! View onto normals_and_tex_coords. NULL for staging.
-			VkBufferView normals_and_tex_coords_view;
+			//! NULL
+			VkBufferView no_vertices_view;
+			//! View onto bone_index_table. NULL for staging.
+			VkBufferView bone_index_table_view;
 			//! View onto material_indices. NULL for staging.
 			VkBufferView material_indices_view;
-			//! View onto triangle. NULL for staging.
-			VkBufferView triangle_view;
 		};
 		//! Views with appropriate formats onto all buffers. NULL for staging.
-		VkBufferView buffer_views[mesh_buffer_count_full];
+		VkBufferView buffer_views[mesh_buffer_count];
 	};
 	//! The memory allocation used for all of the buffers above
 	VkDeviceMemory memory;
@@ -102,15 +106,6 @@ typedef struct mesh_s {
 typedef enum material_texture_type_e {
 	//! The diffuse albedo of the surface. May also impact the specular albedo.
 	material_texture_type_base_color,
-	/*! A texture with parameters for the specular BRDF.
-		- Red holds a (currently unused) occlusion coefficient,
-		- Green holds a linear roughness parameter,
-		- Blue holds metalicity, which controls how the base color affects the
-			reflected color at 0 degrees inclination.*/
-	material_texture_type_specular,
-	//! The tangent space normal vector in Cartesian coordinates. The texture
-	//! is unsigned such that the geometric normal is (0.5, 0.5, 1).
-	material_texture_type_normal,
 	//! The number of textures used to describe one material
 	material_texture_count
 } material_texture_type_t;
@@ -134,24 +129,30 @@ typedef struct materials_s {
 	VkSampler sampler;
 } materials_t;
 
-/*! Combines a single bottom level acceleration structure with a single top
-	level acceleration structure holding only one instance of this bottom level
-	acceleration structure.*/
-typedef struct acceleration_structure_s {
-	union {
-		struct {
-			//! The bottom level acceleration structure holding all scene
-			//! geometry in world space
-			VkAccelerationStructureKHR bottom_level;
-			//! The top level acceleration structure with one instance of
-			//! bottom_level
-			VkAccelerationStructureKHR top_level;
-		};
-		VkAccelerationStructureKHR levels[2];
-	};
-	//! The buffers that hold the bottom and top-level acceleration structures
-	buffers_t buffers;
-} acceleration_structure_t;
+
+//! A densely sampled animation of bones for a skinned mesh. It gets uploaded
+//! to the GPU as texture.
+typedef struct animation_s {
+	//! The time of the first sampled pose in seconds
+	float time_start;
+	//! The time in seconds between two sampled poses
+	float time_step;
+	//! The number of times at which poses have been sampled
+	uint64_t time_sample_count;
+	//! The number of bones for which animations are stored (including dummies)
+	uint64_t bone_count;
+	//! Constants specifying how entries of the animation texture should be
+	//! dequantized from 16-bit uint to floats
+	float dequantization_constants[16];
+	/*! A big texture holding transformation matrices for each frame sample.
+		Row j holds the j-th sample. Column i holds row i % 3 of the 3x4 matrix
+		for bone i / 3.*/
+	images_t texture;
+	//! A sampler with nearest neighbor interpolation, used to read
+	//! transformations
+	VkSampler sampler;
+} animation_t;
+
 
 /*! A static scene that is ready to be rendered. It includes geometry and
 	materials but no cameras or light sources.*/
@@ -160,9 +161,8 @@ typedef struct scene_s {
 	mesh_t mesh;
 	//! The materials used for the mesh
 	materials_t materials;
-	//! Acceleration structures for ray tracing in this scene or a bunch of
-	//! NULL handles if no acceleration structure was requested
-	acceleration_structure_t acceleration_structure;
+	//! The animation of this scene
+	animation_t animation;
 } scene_t;
 
 
@@ -174,11 +174,13 @@ const char* get_material_texture_suffix(material_texture_type_t type);
 /*! Loads a scene from the file at the given path. The calling side has to
 	clean up using destroy_scene(). Textures are supposed to be in a directory
 	at texture_path. Their names are <material name>_<type suffix>.vkt. Such
-	*.vkt files have to be created beforehand using a Python script. If ray
-	tracing is supported by the given device, an acceleration structure will be
-	created on request. Otherwise, the method succeeds without creating one.
+	*.vkt files have to be created beforehand using a Python script. Blend
+	attributes get compressed using the given method. The maximal bone count is
+	changed accordingly using reduce_bone_count() (it cannot be raised). If
+	requested, ground truth blend attributes will be present, even when
+	compressed attributes are also available.
 	\return 0 on success.*/
-int load_scene(scene_t* scene, const device_t* device, const char* file_path, const char* texture_path, VkBool32 request_acceleration_structure);
+int load_scene(scene_t* scene, const device_t* device, const char* file_path, const char* texture_path, const blend_attribute_compression_parameters_t* compression_params, VkBool32 force_ground_truth_blend_attributes);
 
 //! Frees and nulls the given scene
 void destroy_scene(scene_t* scene, const device_t* device);

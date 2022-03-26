@@ -1,4 +1,4 @@
-//  Copyright (C) 2021, Christoph Peters, Karlsruhe Institute of Technology
+//  Copyright (C) 2022, Christoph Peters, Karlsruhe Institute of Technology
 //
 //  This program is free software: you can redistribute it and/or modify
 //  it under the terms of the GNU General Public License as published by
@@ -61,5 +61,7 @@ void get_world_to_projection_space(float world_to_projection_space[4][4], const 
 /*! Implements camera controls based on keyboard and mouse input obtained from
 	GLFW.
 	\param camera The camera that will be updated.
-	\param window The window whose input is used for controlling the camera.*/
-void control_camera(first_person_camera_t* camera, GLFWwindow* window);
+	\param window The window whose input is used for controlling the camera.
+	\return The time in seconds since the last call. This should be used to
+		control the time step for other time dependent processes.*/
+float control_camera(first_person_camera_t* camera, GLFWwindow* window);

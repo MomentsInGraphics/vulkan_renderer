@@ -1,4 +1,4 @@
-#  Copyright (C) 2021, Christoph Peters, Karlsruhe Institute of Technology
+#  Copyright (C) 2022, Christoph Peters, Karlsruhe Institute of Technology
 #
 #  This program is free software: you can redistribute it and/or modify
 #  it under the terms of the GNU General Public License as published by
@@ -77,6 +77,88 @@ def get_morton_code_3d(position, bounding_box_min, bounding_box_max):
     return sum([part_1_by_2(quantized[..., j]) << j for j in range(3)])
 
 
+def matrix_to_quaternion(matrix):
+    """
+    Given an array of shape (..., 3, 3) holding special orthogonal matrices
+    (i.e. rotation matrices), this function returns an array of shape (..., 4)
+    providing the same rotations as unit quaternions. The w-entry is at index 3
+    and chosen to be non-negative.
+    """
+    # This implementation is based on the matrix and quaternion FAQ, Q55
+    # https://www.j3d.org/matrix_faq/matrfaq_latest.html
+    trace = np.trace(matrix, axis1=-1, axis2=-2)
+    diag = np.diagonal(matrix, axis1=-1, axis2=-2)
+    largest_diag = np.argmax(diag, axis=-1)
+    choose_trace = trace > -0.9
+    root = 2.0 * np.sqrt(np.where(choose_trace, 1.0 + trace, 1.0 + 2.0 * np.max(diag, axis=1) - trace))
+    rcp_root = 1.0 / root
+    possible_solutions = [
+        # Diagonal entry 0, 0 largest
+        np.stack([
+            0.25 * root,
+            (matrix[..., 1, 0] + matrix[..., 0, 1]) * rcp_root,
+            (matrix[..., 0, 2] + matrix[..., 2, 0]) * rcp_root,
+            (matrix[..., 2, 1] - matrix[..., 1, 2]) * rcp_root], axis=-1),
+        # Diagonal entry 1, 1 largest
+        np.stack([
+            (matrix[..., 1, 0] + matrix[..., 0, 1]) * rcp_root,
+            0.25 * root,
+            (matrix[..., 2, 1] + matrix[..., 1, 2]) * rcp_root,
+            (matrix[..., 0, 2] - matrix[..., 2, 0]) * rcp_root], axis=-1),
+        # Diagonal entry 2, 2 largest
+        np.stack([
+            (matrix[..., 0, 2] + matrix[..., 2, 0]) * rcp_root,
+            (matrix[..., 2, 1] + matrix[..., 1, 2]) * rcp_root,
+            0.25 * root,
+            (matrix[..., 1, 0] - matrix[..., 0, 1]) * rcp_root], axis=-1),
+        # Clearly positive trace
+        np.stack([
+            (matrix[..., 2, 1] - matrix[..., 1, 2]) * rcp_root,
+            (matrix[..., 0, 2] - matrix[..., 2, 0]) * rcp_root,
+            (matrix[..., 1, 0] - matrix[..., 0, 1]) * rcp_root,
+            0.25 * root], axis=-1),
+    ]
+    # Pick one
+    choice = np.where(choose_trace, 3, largest_diag)
+    choice = np.repeat(choice[..., np.newaxis], 4, axis=-1)
+    result = np.choose(choice, possible_solutions)
+    # Make the real part positive
+    result *= np.where(result[..., 3:] >= 0.0, 1.0, -1.0)
+    return result
+
+
+def pack_transformations(matrix):
+    """
+    Given an array of shape (..., 3, 4) providing transformation matrices, which
+    consist of orientation preserving, isotropic scaling, rotation and
+    translation, this function generates a compact binary representation.
+    :return: A pair constants, data where constants provides 16 floats of meta-
+        data about the quantization and data provides 16 consecutive bytes per
+        packed matrix.
+    """
+    # Flatten the first dimensions for convenience
+    matrix = np.reshape(matrix, (-1, 3, 4))
+    # Extract the scaling
+    scaling = np.linalg.norm(matrix[:, :3, :3], ord="fro", axis=(1, 2)) * np.sqrt(1.0 / 3.0)
+    # Form quaternions and grab translations
+    quaternion = matrix_to_quaternion(matrix[:, :3, :3] / scaling[:, np.newaxis, np.newaxis])
+    translations = matrix[:, :, 3]
+    # The packed data consists of eight 16-bit fixed-point values. The first
+    # four are the unit quaternion, followed by three entries for the position
+    # and one for log2 of the scaling.
+    log_scaling = np.log2(scaling)
+    channels = np.hstack([quaternion, translations, log_scaling[:, np.newaxis]])
+    # The fixed-point coordinates cover exactly the used range
+    mins = np.min(channels, axis=0)
+    maxs = np.max(channels, axis=0)
+    factors = 0xffff / (maxs - mins)
+    summands = -factors * mins + 0.5
+    fixed = np.asarray(channels * factors + summands, dtype=np.uint16)
+    inv_factors = 1.0 / factors
+    inv_summands = -summands / factors
+    return np.concatenate([inv_factors, inv_summands]), pack("H" * fixed.size, *fixed.flat)
+
+
 class Mesh:
     """Efficiently represents relevant data of a mesh after extracting it from 
        a Blender mesh.
@@ -93,6 +175,8 @@ class Mesh:
         self.vertex_position = np.zeros((0, 3), dtype=np.float32)
         self.vertex_normal = np.zeros((0, 3), dtype=np.float32)
         self.vertex_line_radius = np.zeros(0, dtype=np.float32)
+        self.vertex_group_indices = np.zeros((0, 0), dtype=np.uint16)
+        self.vertex_group_weights = np.zeros((0, 0), dtype=np.float32)
 
     @staticmethod
     def from_blender_mesh(mesh, line_radius):
@@ -165,37 +249,49 @@ class Mesh:
         else:
             result.vertex_normal[0::3] = 1.0
         result.vertex_normal = result.vertex_normal.reshape((len(mesh.vertices), 3))
+        # Read group indices and weights into rectangular arrays
+        group_counts = np.asarray([len(vertex.groups) for vertex in mesh.vertices])
+        max_group_count = np.max(group_counts)
+        result.vertex_group_indices = np.zeros((len(mesh.vertices), max_group_count), dtype=np.uint16)
+        result.vertex_group_weights = np.zeros((len(mesh.vertices), max_group_count), dtype=np.float32)
+        for i, group_count in enumerate(group_counts):
+            mesh.vertices[i].groups.foreach_get("group", result.vertex_group_indices[i, :group_count])
+            mesh.vertices[i].groups.foreach_get("weight", result.vertex_group_weights[i, :group_count])
         # Remember the line radius
         if line_mode:
             result.vertex_line_radius = line_radius * np.ones((result.get_vertex_count(),), dtype=np.float32)
         return result
 
     @staticmethod
-    def merge_meshes(lhs, rhs, lhs_material_slot_remap=None, rhs_material_slot_remap=None):
-        """Creates a new Mesh containing the geometry of both of the given 
-           Mesh objects. The slot remaps are list providing a new slot index
-           for each old slot index.
+    def merge_meshes(meshes, material_slot_remaps, group_index_remaps):
+        """
+        Creates a new Mesh containing the geometry of all of the given Mesh
+        objects. The slot/index remaps are one list per mesh providing a new
+        slot/index for each old slot/index.
         """
         result = Mesh()
         # Concatenate vertex arrays
-        result.vertex_position = np.vstack([lhs.vertex_position, rhs.vertex_position])
-        result.vertex_normal = np.vstack([lhs.vertex_normal, rhs.vertex_normal])
-        result.vertex_line_radius = np.concatenate([lhs.vertex_line_radius, rhs.vertex_line_radius])
+        result.vertex_position = np.vstack([mesh.vertex_position for mesh in meshes])
+        result.vertex_normal = np.vstack([mesh.vertex_normal for mesh in meshes])
+        result.vertex_line_radius = np.concatenate([mesh.vertex_line_radius for mesh in meshes])
+        # Remap group indices
+        group_indices_list = [np.asarray(remap)[mesh.vertex_group_indices] for mesh, remap in zip(meshes, group_index_remaps)]
+        # Pad group indices and weights to the same group count
+        max_group_count = np.max([mesh.vertex_group_indices.shape[1] for mesh in meshes])
+        group_indices_list = [np.hstack([indices, np.zeros((indices.shape[0], max_group_count - indices.shape[1]), dtype=np.uint16)]) for indices in group_indices_list]
+        group_weights_list = [np.hstack([mesh.vertex_group_weights, np.zeros((mesh.vertex_group_weights.shape[0], max_group_count - mesh.vertex_group_weights.shape[1]), dtype=np.uint16)]) for mesh in meshes]
+        # Stack them
+        result.vertex_group_indices = np.vstack(group_indices_list)
+        result.vertex_group_weights = np.vstack(group_weights_list)
         # Concatenate primitive arrays, but with appropriate index offsets
-        result.primitive_vertex_count = np.concatenate([lhs.primitive_vertex_count, rhs.primitive_vertex_count])
-        result.primitive_vertex_indices = np.concatenate(
-            [lhs.primitive_vertex_indices, rhs.primitive_vertex_indices + lhs.vertex_position.shape[0]])
+        result.primitive_vertex_count = np.concatenate([mesh.primitive_vertex_count for mesh in meshes])
+        index_offsets = np.cumsum([0] + [mesh.vertex_position.shape[0] for mesh in meshes])
+        result.primitive_vertex_indices = np.concatenate([mesh.primitive_vertex_indices + index_offsets[i] for i, mesh in enumerate(meshes)])
         # Remap material slots
-        remap_list = [lhs_material_slot_remap, rhs_material_slot_remap]
-        material_index_list = list();
-        for mesh, remap in zip([lhs, rhs], remap_list):
-            if remap is not None:
-                material_index_list.append(np.choose(mesh.primitive_material_index, remap))
-            else:
-                material_index_list.append(mesh.primitive_material_index)
+        material_index_list = [np.asarray(remap)[mesh.primitive_material_index] for mesh, remap in zip(meshes, material_slot_remaps)]
         result.primitive_material_index = np.concatenate(material_index_list)
         # Merge UVs
-        result.primitive_vertex_uv = np.vstack([lhs.primitive_vertex_uv, rhs.primitive_vertex_uv])
+        result.primitive_vertex_uv = np.vstack([mesh.primitive_vertex_uv for mesh in meshes])
         return result
 
     def get_primitive_count(self):
@@ -209,37 +305,6 @@ class Mesh:
            quads all count as one primitive.
         """
         return self.vertex_position.shape[0]
-
-    def get_material_sub_mesh(self, material_slot_index):
-        """Returns a partial copy of this Mesh containing only primitives (and 
-           vertices required for them) which use the material with the given 
-           (slot) index.
-        """
-        result = Mesh()
-        # Reduce the primitive lists
-        mask = (self.primitive_material_index == material_slot_index)
-        primitive_count = np.count_nonzero(mask)
-        result.primitive_vertex_count = self.primitive_vertex_count[mask].copy()
-        result.primitive_material_index = material_slot_index * np.ones((primitive_count,), dtype=np.uint32)
-        old_primitive_vertex_primitive_index = np.arange(self.get_primitive_count()).repeat(self.primitive_vertex_count)
-        old_primitive_vertex_mask = mask[old_primitive_vertex_primitive_index]
-        result.primitive_vertex_indices = self.primitive_vertex_indices[old_primitive_vertex_mask].copy()
-        result.primitive_vertex_uv = np.zeros((result.primitive_vertex_indices.size, 2), dtype=np.float32)
-        result.primitive_vertex_uv[:, 0] = self.primitive_vertex_uv[:, 0][old_primitive_vertex_mask]
-        result.primitive_vertex_uv[:, 1] = self.primitive_vertex_uv[:, 1][old_primitive_vertex_mask]
-        # Discard unused vertices
-        remaining_vertex_indices = np.unique(result.primitive_vertex_indices)
-        result.vertex_position = np.zeros((remaining_vertex_indices.size, 3), dtype=np.float32)
-        result.vertex_normal = np.zeros_like(result.vertex_position)
-        for j in range(3):
-            result.vertex_position[:, j] = self.vertex_position[:, j][remaining_vertex_indices]
-            result.vertex_normal[:, j] = self.vertex_normal[:, j][remaining_vertex_indices]
-        result.vertex_line_radius = np.copy(self.vertex_line_radius[remaining_vertex_indices])
-        # Update vertex indices
-        old_index_to_new_index = np.zeros((self.vertex_position.shape[0],), dtype=np.uint32)
-        old_index_to_new_index[remaining_vertex_indices] = np.arange(remaining_vertex_indices.size)
-        result.primitive_vertex_indices.flat = old_index_to_new_index[result.primitive_vertex_indices.flat]
-        return result
 
     def transform(self, matrix_3x4):
         """Multiplies vertex data from the left by the given matrix. The last 
@@ -262,6 +327,19 @@ class Mesh:
             self.primitive_material_index = self.primitive_material_index[::-1]
             self.primitive_vertex_uv = self.primitive_vertex_uv[::-1]
 
+    def normalize_group_weights(self, default_bone_index=0):
+        """
+        Ensures that all group weights are non-negative and that they sum to
+        one for each vertex. If all clamped weights for one vertex are zero, the
+        first weight is set to one and the corresponding index is set to the
+        given default.
+        """
+        self.vertex_group_weights = np.maximum(0.0, self.vertex_group_weights)
+        weight_sums = self.vertex_group_weights.sum(axis=1)
+        self.vertex_group_weights[:, 0] = np.where(weight_sums == 0.0, 1.0, self.vertex_group_weights[:, 0])
+        self.vertex_group_indices[:, 0] = np.where(weight_sums == 0.0, default_bone_index, self.vertex_group_indices[:, 0])
+        self.vertex_group_weights[weight_sums > 0.0, :] /= weight_sums[weight_sums > 0.0, np.newaxis]
+
 
 class Scene:
     """
@@ -269,7 +347,7 @@ class Scene:
     relevant data through objects like Mesh.
     """
 
-    def __init__(self, scene, selection_only, add_triangulate_modifier, split_angle, line_radius):
+    def __init__(self, scene, selection_only, add_triangulate_modifier, split_angle, line_radius, frame_step):
         """
         Loads objects from the given scene and transforms all geometry to world
         space.
@@ -281,6 +359,8 @@ class Scene:
             split modifier in the stack already). The split angle is set
             accordingly and sharp edges are split as well.
         :param line_radius: Forwards to Mesh.from_blender_mesh().
+        :param frame_step: The number of frames between two successive samples.
+            Can be a float.
         """
         # Get the list of potentially relevant objects
         if selection_only:
@@ -303,14 +383,19 @@ class Scene:
                         edge_split.use_edge_angle = True
                         edge_split.use_edge_sharp = True
                         edge_split.split_angle = split_angle
-            # Apply modifiers, etc.
+            # Disable armature modifiers temporarily
+            armature_modifiers = [modifier for modifier in obj.modifiers if modifier.type == "ARMATURE"]
+            if len(armature_modifiers):
+                armature_show_viewport = armature_modifiers[0].show_viewport
+                armature_modifiers[0].show_viewport = False
+            # Apply modifiers (except armature modifiers), etc.
             dependencies_graph = bpy.context.evaluated_depsgraph_get()
             evaluated_object = obj.evaluated_get(dependencies_graph)
             try:
                 blender_mesh = evaluated_object.to_mesh()
             except RuntimeError:
                 # Only message if this outcome was not entirely foreseeable
-                if evaluated_object.type not in ["EMPTY", "GPENCIL", "CAMERA", "LIGHT", "SPEAKER", "LIGHT_PROBE"]:
+                if evaluated_object.type not in ["EMPTY", "GPENCIL", "CAMERA", "LIGHT", "SPEAKER", "LIGHT_PROBE", "ARMATURE"]:
                     print("Skipping object %s since it cannot be converted to a mesh." % obj.name)
                 return "FAILURE"
             if blender_mesh is None:
@@ -319,6 +404,9 @@ class Scene:
             blender_mesh_name = blender_mesh.name
             blender_mesh = None
             evaluated_object.to_mesh_clear()
+            # Reenable armature modifiers
+            if len(armature_modifiers):
+                armature_modifiers[0].show_viewport = armature_show_viewport
             if result == "TRIANGULATE":
                 if not add_triangulate_modifier:
                     print(("Skipping mesh %s because it has a polygon with more than three vertices. "
@@ -334,6 +422,14 @@ class Scene:
                     return "FAILURE"
             return result
 
+        # This is a dictionary mapping unique bones to unique indices. The keys
+        # are tuples of transforms (flattened into tuples), armature object
+        # names and bone names
+        self.bone_dict = dict()
+        # This is a dummy bone with identity transform
+        dummy_bone_key = None, None, None
+        self.bone_dict[dummy_bone_key] = 0
+
         # Try to create a Mesh for each of them
         self.mesh_list = list()
         for collection_to_world_space, obj in object_list:
@@ -346,9 +442,23 @@ class Scene:
                 continue
             else:
                 mesh = result
-            # Transform the vertex data to world space
-            transform = collection_to_world_space @ np.asarray(obj.matrix_world)
-            mesh.transform(transform[:3, :])
+            # Check if there is an armature. If so assign unique indices to its
+            # bones and bind them to vertex groups.
+            armature_modifiers = [modifier for modifier in obj.modifiers if modifier.type == "ARMATURE"]
+            if len(armature_modifiers) > 0 and armature_modifiers[0].object is not None:
+                armature = armature_modifiers[0].object
+                mesh.group_bone_keys = list()
+                for group in obj.vertex_groups:
+                    key = (tuple(collection_to_world_space.flat), armature.name, group.name)
+                    mesh.group_bone_keys.append(key)
+                    if key not in self.bone_dict:
+                        self.bone_dict[key] = len(self.bone_dict)
+            else:
+                # Transform the vertex data to world space and associate the
+                # mesh with the dummy bone
+                mesh.group_bone_keys = [dummy_bone_key]
+                transform = collection_to_world_space @ np.asarray(obj.matrix_world)
+                mesh.transform(transform[:3, :])
             # Annotate the mesh with the materials used for the various slots
             mesh.slot_material_name = list()
             for material_slot in obj.material_slots:
@@ -359,6 +469,46 @@ class Scene:
             if len(mesh.slot_material_name) == 0:
                 mesh.slot_material_name = ["no_material_assigned"]
             self.mesh_list.append(mesh)
+
+        # Define times at which poses are sampled
+        self.frame_step = float(frame_step)
+        self.frame_start = float(scene.frame_start)
+        frame_end = float(scene.frame_end)
+        frame_times = np.arange(self.frame_start, frame_end + 1.0e-10, self.frame_step)
+        self.frame_count = len(frame_times)
+        # Record animations for all bones by playing them back
+        old_frame = scene.frame_current, scene.frame_subframe
+        self.bone_transforms = np.zeros((self.frame_count, len(self.bone_dict), 3, 4), dtype=np.float32)
+        for i, frame in enumerate(frame_times):
+            scene.frame_set(int(np.floor(frame)), subframe=frame - np.floor(frame))
+            for transform_tuple, armature_name, bone_name in self.bone_dict.keys():
+                bone_index = self.bone_dict[transform_tuple, armature_name, bone_name]
+                if transform_tuple is None:
+                    self.bone_transforms[i, bone_index, :, :3] = np.eye(3)
+                    continue
+                armature = scene.objects[armature_name]
+                if bone_name in armature.pose.bones:
+                    pose_bone = armature.pose.bones[bone_name]
+                    self.bone_transforms[i, bone_index, :, :] = np.asarray(pose_bone.matrix)[:3, :]
+                else:
+                    self.bone_transforms[i, bone_index, :, :3] = np.eye(3)
+        scene.frame_set(old_frame[0], subframe=old_frame[1])
+        # Currently, we have bone to armature space transforms. Now we turn that
+        # into object to world space transforms
+        for transform_tuple, armature_name, bone_name in self.bone_dict.keys():
+            bone_index = self.bone_dict[transform_tuple, armature_name, bone_name]
+            if transform_tuple is not None:
+                armature = scene.objects[armature_name]
+                collection_to_world_space = np.asarray(transform_tuple).reshape(4, 4)
+                armature_to_collection_space = armature.matrix_world
+                armature_to_world_space = collection_to_world_space @ armature_to_collection_space
+                if bone_name in armature.data.bones:
+                    bone = armature.data.bones[bone_name]
+                    object_to_bone_space = np.linalg.inv(bone.matrix_local)
+                else:
+                    object_to_bone_space = np.eye(4)
+                self.bone_transforms[:, bone_index, :, :] = np.einsum("jk, ikl, lm -> ijm", armature_to_world_space[:3, :3], self.bone_transforms[:, bone_index, :, :], object_to_bone_space)
+                self.bone_transforms[:, bone_index, :, 3] += armature_to_world_space[np.newaxis, :3, 3]
 
     def handle_instanced_collections(self, object_list):
         """Given a list of pairs with 4x4 numpy collection to world space 
@@ -387,51 +537,28 @@ class Scene:
             material_list.extend(mesh.slot_material_name)
         return frozenset(material_list)
 
-    def get_material_sub_mesh(self, material_name):
-        """Returns a single Mesh that arises from the combination of all 
-           primitives in all meshes that use the material with the given 
-           name. If there are no such primitives, it returns None.
-        """
-        reduced_mesh_list = list()
-        for mesh in self.mesh_list:
-            if material_name in mesh.slot_material_name:
-                reduced_mesh_list.append(mesh.get_material_sub_mesh(mesh.slot_material_name.index(material_name)))
-        if len(reduced_mesh_list) == 0:
-            return None
-        # Merge them all together
-        merged_mesh = reduced_mesh_list[0]
-        for rhs_mesh in reduced_mesh_list[1:]:
-            merged_mesh = Mesh.merge_meshes(merged_mesh, rhs_mesh)
-        if merged_mesh.get_primitive_count() > 0:
-            return merged_mesh
-        else:
-            return None
-
     def get_merged_mesh(self):
         """This function merges all meshes in this scene into a single mesh.
-           Material indices are updated as needed. The returned Mesh has a
-           valid slot_material_name providing material names for each slot
-           index."""
+           Material indices are updated as needed. The returned Mesh has a valid
+           slot_material_name providing material names for each slot index.
+           Group indices are all made to match self.bone_dict."""
         if len(self.mesh_list) == 0:
             return None
-        # Early out if no merging is needed
-        if len(self.mesh_list) == 1:
-            return self.mesh_list[0]
         # Merge material lists
         used_material_list = sorted(list(self.get_material_set()))
         material_index_dict = dict([(name, i) for i, name in enumerate(used_material_list)])
         # Merge meshes sequentially
-        remap_list = [[material_index_dict[name] for name in mesh.slot_material_name] for mesh in self.mesh_list]
-        merged_mesh = self.mesh_list[0]
-        for i in range(1, len(self.mesh_list)):
-            lhs_remap = remap_list[0] if i == 1 else None
-            rhs_remap = remap_list[i]
-            merged_mesh = Mesh.merge_meshes(merged_mesh, self.mesh_list[i], lhs_remap, rhs_remap)
+        material_remap_list = [[material_index_dict[name] for name in mesh.slot_material_name] for mesh in self.mesh_list]
+        group_remap_list = [[self.bone_dict[key] for key in mesh.group_bone_keys] for mesh in self.mesh_list]
+        merged_mesh = Mesh.merge_meshes(self.mesh_list, material_remap_list, group_remap_list)
         merged_mesh.slot_material_name = used_material_list
+        merged_mesh.group_bone_keys = [None] * len(self.bone_dict)
+        for key, index in self.bone_dict.items():
+            merged_mesh.group_bone_keys[index] = key
         return merged_mesh
 
 
-def export_scene(blender_scene, scene_file_path, selection_only, add_triangulate_modifier, split_angle, sort_triangles):
+def export_scene(blender_scene, scene_file_path, selection_only, add_triangulate_modifier, split_angle, sort_triangles, frame_step):
     """
     Exports the given bpy.types.scene to the *.vks file at the given path. Some
     parameters forward to Scene.__init__().
@@ -441,12 +568,13 @@ def export_scene(blender_scene, scene_file_path, selection_only, add_triangulate
     if path.splitext(scene_file_path)[1] == ".blend":
         scene_file_path = path.splitext(scene_file_path)[0] + ".vks"
     # Bring the scene into Python objects
-    scene = Scene(blender_scene, selection_only, add_triangulate_modifier, split_angle, None)
+    scene = Scene(blender_scene, selection_only, add_triangulate_modifier, split_angle, None, frame_step)
     if len(scene.mesh_list) == 0:
         print("No meshes are available to export. Aborting.")
         return
     # Merge together all meshes of the scene with updated material indices
     mesh = scene.get_merged_mesh()
+    mesh.normalize_group_weights()
     used_material_list = mesh.slot_material_name
     # Abort if something does not use triangles
     triangle_count = np.count_nonzero(mesh.primitive_vertex_count == 3)
@@ -470,7 +598,7 @@ def export_scene(blender_scene, scene_file_path, selection_only, add_triangulate
     # Open the output file
     file = open(scene_file_path, "wb")
     # Write file format marker and version
-    file.write(pack("II", 0x00abcabc, 1))
+    file.write(pack("II", 0x00abcabc, 2))
     # Write the number of materials, primitives and vertices
     file.write(pack("QQ", len(used_material_list), triangle_count))
     # Quantize vertex positions to 21 bits per coordinate
@@ -485,6 +613,16 @@ def export_scene(blender_scene, scene_file_path, selection_only, add_triangulate
     dequantization_summand = box_min + 0.5 * dequantization_factor
     file.write(pack("fff", *dequantization_factor.flat))
     file.write(pack("fff", *dequantization_summand.flat))
+    # Write the number of bone influences per vertex and the number of unique
+    # bone index tuples
+    sorted_indices = np.take_along_axis(mesh.vertex_group_indices, np.argsort(mesh.vertex_group_weights, axis=1), axis=1)
+    max_tuple_count = np.unique(sorted_indices, axis=0).shape[0]
+    file.write(pack("QQ", mesh.vertex_group_indices.shape[1], max_tuple_count))
+    # Write meta data about animations
+    frame_start_in_secs = scene.frame_start / blender_scene.render.fps
+    frame_step_in_secs = scene.frame_step / blender_scene.render.fps
+    file.write(pack("ffQQ", frame_start_in_secs, frame_step_in_secs, scene.frame_count, scene.bone_transforms.shape[1]))
+
     # Make a few changes to material names to support ORCA assets
     used_material_list = [re.sub(r"\.[0-9][0-9][0-9]$", "", name) for name in used_material_list]
     used_material_list = [name.replace(".DoubleSided", "") for name in used_material_list]
@@ -501,9 +639,7 @@ def export_scene(blender_scene, scene_file_path, selection_only, add_triangulate
     packed_positions[:, 0] += (quantized_positions[:, 1] & 0x7FF) << 21
     packed_positions[:, 1] = (quantized_positions[:, 1] & 0x1FF800) >> 11
     packed_positions[:, 1] += quantized_positions[:, 2] << 10
-    triangle_list_positions = np.zeros((triangle_count * 3, 2), dtype=np.uint32)
-    triangle_list_positions[:, 0] = packed_positions[:, 0][indices]
-    triangle_list_positions[:, 1] = packed_positions[:, 1][indices]
+    triangle_list_positions = packed_positions[indices, :]
     file.write(pack("I" * triangle_list_positions.size, *triangle_list_positions.flat))
     # Pack texture coordinate pairs into 32 bit. We allow a texture to
     # repeat up to eight times within one triangle.
@@ -524,24 +660,33 @@ def export_scene(blender_scene, scene_file_path, selection_only, add_triangulate
     normal_and_uv[:, 1] = packed_normal_1[indices]
     # Write normal vectors and texture coordinates
     file.write(pack("H" * normal_and_uv.size, *normal_and_uv.flat))
+    # Write uncompressed bone indices and weights
+    triangle_list_group_indices = mesh.vertex_group_indices[indices, :]
+    file.write(pack("H" * triangle_list_group_indices.size, *triangle_list_group_indices.flat))
+    triangle_list_group_weights = mesh.vertex_group_weights[indices, :]
+    file.write(pack("f" * triangle_list_group_weights.size, *triangle_list_group_weights.flat))
     # Write the material index for each primitive
     file.write(pack("B" * triangle_count, *mesh.primitive_material_index))
+    # Write the sampled animations
+    transform_meta_data, transform_data = pack_transformations(scene.bone_transforms)
+    file.write(pack("f" * transform_meta_data.size, *transform_meta_data))
+    file.write(transform_data)
     # Write an end of file marker
     file.write(pack("I", 0x00e0fe0f))
     file.close()
-    print("Wrote %d materials and %d primitives." % (len(used_material_list), triangle_count))
+    print("Wrote %d materials, %d primitives, %d bones and %d bones per vertex." % (len(used_material_list), triangle_count, len(scene.bone_dict), mesh.vertex_group_indices.shape[1]))
     print("-###- Export completed. -###-")
     print()
 
 
 # Provide meta information for Blender
 bl_info = {
-    "name": "Vulkan renderer scene exporter (*.vks)",
+    "name": "Vulkan renderer animated scene exporter (*.vks)",
     "author": "Christoph Peters",
-    "version": (1, 0, 0),
+    "version": (2, 0, 0),
     "blender": (2, 82, 0),
     "location": "file > Export",
-    "description": "This addon exports scenes from Blender to the Vulkan renderer.",
+    "description": "This addon exports animated scenes from Blender to the Vulkan renderer.",
     "warning": "",
     "category": "Import-Export"
 }
@@ -561,7 +706,7 @@ class VulkanExportOperator(bpy.types.Operator):
         export_path = bpy.path.abspath(self.filepath)
         export_scene(context.scene, export_path, self.selection_only, self.add_triangulate_modifier,
                      self.edge_split_angle if self.add_edge_split_modifier else None,
-                     self.sort_triangles)
+                     self.sort_triangles, self.frame_step)
         return {"FINISHED"}
 
     # Settings of this operator
@@ -585,6 +730,10 @@ class VulkanExportOperator(bpy.types.Operator):
                                               description="The split angle set for new edge split modifiers.",
                                               subtype="ANGLE", unit="ROTATION", min=0.0, max=np.pi,
                                               default=30.0 * np.pi / 180.0)
+    frame_step: bpy.props.FloatProperty(name="Frame step",
+                                        description="The distance in frames between two successive samples of the animation.",
+                                        subtype="TIME", unit="TIME", min=0.01, max=100.0,
+                                        default=0.5)
     sort_triangles: bpy.props.BoolProperty(name="Sort triangles",
                                            description="Sort triangles of the mesh by the Morton code of their "
                                                        + "centroid. This may improve memory coherence in rendering",
