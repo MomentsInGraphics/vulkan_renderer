@@ -249,7 +249,7 @@ int create_acceleration_structure(acceleration_structure_t* structure, const dev
 	};
 	pvkGetAccelerationStructureBuildSizesKHR(
 		device->device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
-		&top_build_info, &primitive_count, &top_sizes);
+		&top_build_info, &top_build_info.geometryCount, &top_sizes);
 	
 	// Create buffers for the acceleration structures
 	VkAccelerationStructureBuildSizesInfoKHR sizes[2] = { bottom_sizes, top_sizes };
@@ -257,12 +257,12 @@ int create_acceleration_structure(acceleration_structure_t* structure, const dev
 		{
 			.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
 			.size = sizes[0].accelerationStructureSize,
-			.usage = VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR,
+			.usage = VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR,
 		},
 		{
 			.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
 			.size = sizes[1].accelerationStructureSize,
-			.usage = VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR,
+			.usage = VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR,
 		},
 	};
 	if (create_buffers(&structure->buffers, device, buffer_requests, 2, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
